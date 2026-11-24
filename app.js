@@ -43,6 +43,19 @@ function commit() {
   onState(pub);
 }
 function hDropTake(sc, t) { HOST.media.delete(t.src); sc.takes.splice(sc.takes.indexOf(t), 1); }
+function hApplyParts(sc, roles, partsIn) {
+  const names = [...new Set((roles || []).map(n => String(n).trim().slice(0, 24)).filter(Boolean))].slice(0, 10);
+  if (!names.length) throw new Error('Add at least one character');
+  sc.roles = names.map(name => ({ name, owner: sc.roles.find(r => r.name === name)?.owner || null }));
+  const dur = sc.duration || 600;
+  const parts = (partsIn || []).slice(0, 80).map(p => ({ role: String(p.role), start: Math.max(0, +p.start || 0), end: Math.min(dur, +p.end || 0), hint: String(p.hint || '').slice(0, 60) }))
+    .filter(p => names.includes(p.role) && p.end - p.start >= 0.2).sort((x, y) => x.start - y.start);
+  sc.parts = parts.map(p => {
+    const same = sc.parts.find(o => o.role === p.role && Math.abs(o.start - p.start) < 0.01 && Math.abs(o.end - p.end) < 0.01);
+    return { id: same ? same.id : 'p' + uid(5), ...p };
+  });
+  for (const t of [...sc.takes]) if (!sc.parts.some(p => p.id === t.partId)) hDropTake(sc, t);
+}
 function act(a, d) {
   const s = HOST.S, pid = d.playerId, isHost = pid === s.hostId;
   if (a === 'join') {
@@ -88,17 +101,7 @@ function act(a, d) {
     case 'setParts': {
       const sc = hScene(d.sceneId);
       if (!(isHost || sc.createdBy === pid)) throw new Error('Only the host or whoever added the clip can cut it');
-      const names = [...new Set((d.roles || []).map(n => String(n).trim().slice(0, 24)).filter(Boolean))].slice(0, 10);
-      if (!names.length) throw new Error('Add at least one character');
-      sc.roles = names.map(name => ({ name, owner: sc.roles.find(r => r.name === name)?.owner || null }));
-      const dur = sc.duration || 600;
-      const parts = (d.parts || []).slice(0, 80).map(p => ({ role: String(p.role), start: Math.max(0, +p.start || 0), end: Math.min(dur, +p.end || 0), hint: String(p.hint || '').slice(0, 60) }))
-        .filter(p => names.includes(p.role) && p.end - p.start >= 0.2).sort((x, y) => x.start - y.start);
-      sc.parts = parts.map(p => {
-        const same = sc.parts.find(o => o.role === p.role && Math.abs(o.start - p.start) < 0.01 && Math.abs(o.end - p.end) < 0.01);
-        return { id: same ? same.id : 'p' + uid(5), ...p };
-      });
-      for (const t of [...sc.takes]) if (!sc.parts.some(p => p.id === t.partId)) hDropTake(sc, t);
+      hApplyParts(sc, d.roles, d.parts);
       hEvent('info', `${hName(pid)} cut '${sc.title}' into ${sc.parts.length} lines`); break;
     }
     case 'deleteTake': {
@@ -127,6 +130,7 @@ function hUpload(pid, kind, meta, blob) {
     HOST.S.scenes.push({ id: uid(), title, kind: 'video', src: id, createdBy: pid, duration: dur,
       roles: [{ name: 'Character 1', owner: null }, { name: 'Character 2', owner: null }],
       parts: [{ id: 'p0', role: 'Character 1', start: 0, end: dur, hint: 'whole clip - cut it into lines!' }], takes: [] });
+    if (Array.isArray(meta.roles) && Array.isArray(meta.parts)) { try { hApplyParts(HOST.S.scenes.at(-1), meta.roles, meta.parts); } catch { } }
     hEvent('info', `${hName(pid)} uploaded '${title}'`);
   } else {
     const sc = hScene(meta.sceneId), part = sc.parts.find(p => p.id === meta.partId);
@@ -306,7 +310,7 @@ function loadBuf(id) {
 const PRE = 0.25, POST = 0.6, LEAD = 1.5;
 function clipItem(buf, at, part) { return { buf, at, s0: part.start - PRE, s1: part.end + POST, partId: part.id }; }
 class Mixer {
-  constructor() { this.items = []; this.nodes = []; this.ready = Promise.resolve(); this.key = null; }
+  constructor(out) { this.items = []; this.nodes = []; this.ready = Promise.resolve(); this.key = null; this.out = out; }
   set(scene) {
     const list = scene.takes.map(t => ({ t, part: scene.parts.find(p => p.id === t.partId) })).filter(x => x.part);
     const key = list.map(x => x.t.id + x.part.start + x.part.end).join();
@@ -322,7 +326,7 @@ class Mixer {
       const start = Math.max(it.s0, from, it.at);
       const end = Math.min(it.s1, it.at + it.buf.duration);
       if (start >= end) continue;
-      const n = AC.createBufferSource(); n.buffer = it.buf; n.connect(AC.destination);
+      const n = AC.createBufferSource(); n.buffer = it.buf; n.connect(this.out || AC.destination);
       n.start(now + (start - from), start - it.at, end - start);
       this.nodes.push(n);
     }
@@ -504,6 +508,8 @@ function renderStudio() {
   $('#hostBar').innerHTML = `<span class="room">Game <b>${esc(roomCode)}</b></span><button class="btn good" id="copyInvite">📋 Copy invite link</button>` + (isHost()
     ? `<button class="btn" id="startPrem" ${S.scenes.length ? '' : 'disabled'}>🍿 Start premiere (${withVoices || S.scenes.length} scenes)</button>`
     : `<span class="me-tag">👑 ${esc(host?.name || '?')} hosts &amp; starts the premiere</span>`);
+  $('#hostBar').insertAdjacentHTML('beforeend', `<button class="btn" id="dlMovieBtn" ${S.scenes.some(x => x.takes.length) ? '' : 'disabled'} title="All scenes with voices, one after another">⬇ Download the movie</button>`);
+  $('#dlMovieBtn').onclick = () => renderMovie(S.scenes.filter(x => x.takes.length), 'Dub Club movie', true);
   $('#copyInvite').onclick = copyInvite;
   $('#startPrem') && ($('#startPrem').onclick = () => api('premiereStart'));
 
@@ -520,7 +526,7 @@ function renderStudio() {
   if (!$('#addScenes').children.length) {
     $('#addScenes').innerHTML = Object.values(SCENES).map(d => `<button class="add-tile" data-act="add" data-key="${d.key}">
       <img src="${builtinThumb(d.key)}" alt=""><div>${esc(d.title)}<br><span class="me-tag">${d.duration}s · ${d.roles.map(r => esc(r.name)).join(' & ')}</span></div></button>`).join('')
-      + `<label class="add-tile upload"><div>📁 Upload your own clip<br><span class="me-tag">mp4 / webm, max 60 MB.<br>The game cuts it into lines.</span></div><input type="file" accept="video/*" id="uploadInput" hidden></label>`;
+      + `<label class="add-tile upload"><div>📁 Upload your own clip<br><span class="me-tag">mp4 / webm (max 60 MB)<br>or a saved .dubclub project</span></div><input type="file" accept="video/*,.dubclub" id="uploadInput" hidden></label>`;
     $('#uploadInput').onchange = uploadVideo;
   }
 }
@@ -544,6 +550,7 @@ function videoDuration(file) {
 async function uploadVideo(e) {
   const f = e.target.files[0]; e.target.value = '';
   if (!f) return;
+  if (/\.dubclub$/i.test(f.name)) return importProject(f);
   if (f.size > MAX_VIDEO) return toast('That clip is too big (max 60 MB). Try a shorter one!', 'err');
   const t = toast(`Uploading ${esc(f.name)}…`, '', 600000);
   try {
@@ -555,7 +562,7 @@ async function uploadVideo(e) {
 }
 
 // ================================================================== dubbing booth
-const booth = { sceneId: null, player: new ScenePlayer($('#boothStage')), mixer: new Mixer(), rec: null, pending: null, busy: false, sel: null, recPart: null };
+const booth = { sceneId: null, player: new ScenePlayer($('#boothStage')), mixer: new Mixer(), rec: null, pending: null, busy: false, sel: null, recPart: null, recToken: 0 };
 const ed = { open: false, roles: [], parts: [] };
 let micStream = null;
 const bScene = () => S?.scenes.find(x => x.id === booth.sceneId);
@@ -567,6 +574,7 @@ async function openBooth(sceneId) {
   $('#booth').hidden = false; $('#reviewBar').hidden = true;
   $('#boothTitle').textContent = '🎙 ' + s.title;
   $('#origRow').hidden = s.kind !== 'video';
+  $('#dlProjectBtn').hidden = s.kind !== 'video';
   $('#timeline').innerHTML = '';
   setBusy(true);
   updateBooth();
@@ -670,7 +678,7 @@ $('#partList').onclick = e => {
 function stopAll() {
   if (booth.rec && booth.rec.state === 'recording') booth.rec.stop();
   booth.player.stop(); booth.mixer.stop();
-  $('#stopBtn').hidden = true; $('#recDot').hidden = true; $('#countdown').hidden = true; $('#cue').hidden = true;
+  $('#stopBtn').hidden = true; $('#redoBtn').hidden = true; $('#recDot').hidden = true; $('#countdown').hidden = true; $('#cue').hidden = true;
   setBusy(false);
 }
 function setBusy(b) {
@@ -693,7 +701,7 @@ async function watchPart(p) {
   booth.player.onEnd = stopAll;
   booth.player.play(a, b); booth.mixer.play(a);
 }
-$('#stopBtn').onclick = () => { if (booth.rec?.state === 'recording') finishRecording(); else stopAll(); };
+$('#stopBtn').onclick = () => { if (booth.rec?.state === 'recording') finishRecording(); else { booth.recToken++; stopAll(); } };
 
 async function getMic() {
   if (micStream) return micStream;
@@ -714,12 +722,14 @@ async function recordPart(p) {
   clipSound(wantOrig());
   let stream;
   try { stream = await getMic(); } catch (e) { return toast('🎤 ' + esc(e.message || 'Microphone not allowed'), 'err', 8000); }
+  const token = ++booth.recToken;
   setBusy(true); $('#reviewBar').hidden = true; booth.pending = null; booth.recPart = p.id;
+  $('#redoBtn').hidden = false; $('#stopBtn').hidden = false;
   await booth.mixer.ready;
   const [a, b] = lineWindow(p);
   booth.player.seek(a);
   const cd = $('#countdown'); cd.hidden = false;
-  for (const n of [3, 2, 1]) { cd.textContent = n; await sleep(700); if (!booth.sceneId) return; }
+  for (const n of [3, 2, 1]) { cd.textContent = n; await sleep(700); if (!booth.sceneId || token !== booth.recToken) return; }
   cd.hidden = true;
   const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'].find(m => window.MediaRecorder?.isTypeSupported(m)) || '';
   const rec = booth.rec = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
@@ -727,7 +737,7 @@ async function recordPart(p) {
   let at = a;
   rec.ondataavailable = e => e.data.size && chunks.push(e.data);
   rec.onstop = async () => {
-    if (!booth.sceneId) return;
+    if (!booth.sceneId || rec.discard) return;
     const blob = new Blob(chunks, { type: (rec.mimeType || 'audio/webm').split(';')[0] });
     try {
       const buf = await AC.decodeAudioData(await blob.arrayBuffer());
@@ -742,8 +752,22 @@ async function recordPart(p) {
   booth.player.play(a, b);
   if ($('#hearOthers').checked) booth.mixer.play(a, [], p.id);
   at = a - (performance.now() - t0) / 1000;
-  $('#recDot').hidden = false; $('#stopBtn').hidden = false;
+  $('#recDot').hidden = false; $('#stopBtn').hidden = false; $('#redoBtn').hidden = false;
 }
+// Throw away the take in progress and start that line again right away
+function redoRecording() {
+  const sc = bScene(), p = (booth.pending?.part) || sc?.parts.find(x => x.id === booth.recPart);
+  if (!p) return;
+  booth.recToken++;
+  if (booth.rec) booth.rec.discard = true;
+  stopAll(); booth.pending = null; $('#reviewBar').hidden = true;
+  recordPart(p);
+}
+$('#redoBtn').onclick = redoRecording;
+document.addEventListener('keydown', e => {
+  if ($('#booth').hidden || !$('#cutter').hidden || /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+  if (e.key.toLowerCase() === 'r' && (booth.rec?.state === 'recording' || !$('#countdown').hidden || booth.pending)) { e.preventDefault(); redoRecording(); }
+});
 function finishRecording() { if (booth.rec?.state === 'recording') booth.rec.stop(); stopAll(); }
 
 $('#previewTakeBtn').onclick = async () => {
@@ -755,7 +779,7 @@ $('#previewTakeBtn').onclick = async () => {
   booth.player.play(a, b);
   booth.mixer.play(a, [clipItem(pd.buf, pd.at, pd.part)], pd.part.id);
 };
-$('#discardTakeBtn').onclick = () => { booth.pending = null; $('#reviewBar').hidden = true; };
+$('#discardTakeBtn').onclick = redoRecording;
 $('#saveTakeBtn').onclick = async () => {
   const pd = booth.pending; if (!pd) return;
   setBusy(true);
@@ -1084,4 +1108,111 @@ async function runPremiereScene(P) {
     if (isHost() && prem.auto) setTimeout(() => { if (prem.token === token && S.phase === 'premiere') api('premiereGo', { index: P.index + 1 }); }, 2500);
   };
   prem.player.play(elapsed); prem.mixer.play(elapsed);
+}
+
+// ================================================================== downloads: dubbed video + project files
+function saveFile(blob, name) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = name.replace(/[\\/:*?"<>|]+/g, '_'); document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+const render = { cancel: false, busy: false };
+$('#renderCancel').onclick = () => { render.cancel = true; };
+// Plays the scenes into a canvas + an audio mix and records both with MediaRecorder (real time).
+async function renderMovie(scenes, name, titles) {
+  if (render.busy) return;
+  if (!scenes.length) return toast('Nothing to download yet — record some voices first!', 'err');
+  if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) return toast('Your browser cannot make videos. Try Chrome or Edge.', 'err');
+  render.busy = true; render.cancel = false; stopAll(); AC.resume();
+  const W = 1280, H = 720, c = document.createElement('canvas'); c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+  $('#renderStage').innerHTML = ''; $('#renderStage').append(c);
+  $('#renderBox').hidden = false; $('#renderTitle').textContent = `🎬 Making “${name}”…`; $('#renderBar').style.width = '0%';
+  const dest = AC.createMediaStreamDestination();
+  const mime = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'].find(m => MediaRecorder.isTypeSupported(m)) || '';
+  const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+  const rec = new MediaRecorder(new MediaStream([...c.captureStream(30).getVideoTracks(), ...dest.stream.getAudioTracks()]), { ...(mime ? { mimeType: mime } : {}), videoBitsPerSecond: 5e6 });
+  const chunks = []; rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+  const total = scenes.reduce((n, sc) => n + (sc.duration || 10) + (titles ? 2 : 0), 0);
+  let doneTime = 0;
+  const progress = t => { $('#renderBar').style.width = Math.min(100, (doneTime + t) / total * 100) + '%'; };
+  const frame = () => new Promise(r => requestAnimationFrame(r));
+  const card = (title, sub) => {
+    ctx.fillStyle = '#15122b'; ctx.fillRect(0, 0, W, H); ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
+    ctx.font = 'bold 64px system-ui, sans-serif'; ctx.fillText(title, W / 2, H / 2 - 10);
+    ctx.font = '30px system-ui, sans-serif'; ctx.fillStyle = '#a59fd0'; sub.forEach((l, i) => ctx.fillText(l, W / 2, H / 2 + 50 + i * 40));
+  };
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  rec.start(500);
+  try {
+    for (const sc of scenes) {
+      if (render.cancel) break;
+      if (titles) {
+        const t0 = performance.now();
+        while (performance.now() - t0 < 2000 && !render.cancel) { card(sc.title, castOf(sc).slice(0, 4)); progress((performance.now() - t0) / 1000); await frame(); }
+        doneTime += 2;
+      }
+      const mixer = new Mixer(dest); await mixer.set(sc);
+      if (sc.kind === 'builtin') {
+        const def = SCENES[sc.key], t0 = performance.now(); mixer.play(0);
+        for (let t = 0; t < def.duration && !render.cancel; t = (performance.now() - t0) / 1000) {
+          ctx.save(); ctx.scale(W / SCENE_W, H / SCENE_H); def.draw(ctx, t); ctx.restore(); progress(t); await frame();
+        }
+      } else {
+        const v = document.createElement('video'); v.muted = true; v.playsInline = true; v.src = await mediaURL(sc.src);
+        await new Promise(r => { v.oncanplay = r; v.onerror = r; setTimeout(r, 8000); });
+        await v.play().catch(() => { });
+        mixer.play(v.currentTime);
+        while (!v.ended && !v.paused && !render.cancel) {
+          const vw = v.videoWidth || 16, vh = v.videoHeight || 9, k = Math.min(W / vw, H / vh);
+          ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+          ctx.drawImage(v, (W - vw * k) / 2, (H - vh * k) / 2, vw * k, vh * k);
+          progress(v.currentTime); await frame();
+        }
+        v.pause();
+      }
+      mixer.stop(); doneTime += sc.duration || 10;
+    }
+    if (titles && !render.cancel) {
+      const names = [...new Set(scenes.flatMap(x => x.takes.map(t => t.playerName)))];
+      const t0 = performance.now();
+      while (performance.now() - t0 < 2500) { card('The End', ['Voices: ' + names.join(', ')]); await frame(); }
+    }
+    await new Promise(r => { rec.onstop = r; rec.stop(); });
+    if (render.cancel) toast('Download cancelled');
+    else { saveFile(new Blob(chunks, { type: (mime || 'video/webm').split(';')[0] }), `${name}.${ext}`); toast(`⬇ “${esc(name)}.${ext}” downloaded!`, '', 6000); }
+  } catch (e) { toast('Making the video failed: ' + esc(e.message), 'err'); try { rec.stop(); } catch { } }
+  $('#renderBox').hidden = true; $('#renderStage').innerHTML = ''; render.busy = false;
+}
+$('#dlSceneBtn').onclick = () => {
+  const sc = bScene(); if (!sc) return;
+  if (!sc.takes.length && !confirm('No voices recorded yet. Download it silent anyway?')) return;
+  renderMovie([sc], sc.title + ' (dubbed)', false);
+};
+
+// Project file = "DUBCLUB1" + 4-byte JSON length + JSON (title, characters, lines) + the clip itself
+const MAGIC = 'DUBCLUB1';
+$('#dlProjectBtn').onclick = async () => {
+  const sc = bScene(); if (!sc || sc.kind !== 'video') return;
+  try {
+    const clip = await getMedia(sc.src);
+    const json = new TextEncoder().encode(JSON.stringify({ v: 1, title: sc.title, duration: sc.duration, type: clip.type,
+      roles: sc.roles.map(r => r.name), parts: sc.parts.map(({ role, start, end, hint }) => ({ role, start, end, hint })) }));
+    const head = new Uint8Array(12); head.set(new TextEncoder().encode(MAGIC)); new DataView(head.buffer).setUint32(8, json.length);
+    saveFile(new Blob([head, json, clip], { type: 'application/octet-stream' }), sc.title + '.dubclub');
+    toast('💾 Project saved! Upload the .dubclub file in any game to get the clip back with all its characters and lines.', '', 7000);
+  } catch (e) { toast('Saving failed: ' + esc(e.message), 'err'); }
+};
+async function importProject(f) {
+  const t = toast(`Importing ${esc(f.name)}…`, '', 600000);
+  try {
+    const buf = await f.arrayBuffer(), head = new TextDecoder().decode(buf.slice(0, 8));
+    if (head !== MAGIC) throw new Error('This is not a Dub Club project file');
+    const len = new DataView(buf).getUint32(8), meta = JSON.parse(new TextDecoder().decode(buf.slice(12, 12 + len)));
+    const clip = new Blob([buf.slice(12 + len)], { type: meta.type || 'video/mp4' });
+    if (clip.size > MAX_VIDEO) throw new Error('The clip inside is too big (max 60 MB)');
+    await upload('video', { title: meta.title, duration: meta.duration, roles: meta.roles, parts: meta.parts }, clip);
+    toast(`Imported “${esc(meta.title)}” with ${meta.parts?.length || 0} lines! Pick who voices which character.`, '', 7000);
+  } catch (e) { toast('Import failed: ' + esc(e.message), 'err'); }
+  t.remove();
 }
