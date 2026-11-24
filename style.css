@@ -116,3 +116,23 @@ main { padding: 4px 24px 40px; min-width: 0; }
 .room b { color: var(--accent); letter-spacing: .1em; }
 .thumb.clip { display: grid; place-items: center; font-size: 46px; background: linear-gradient(135deg, #3b2f7a, #5a1f4f); }
 .loading { height: 100%; display: grid; place-items: center; color: var(--muted); font-size: 20px; }
+.booth-cols { display: grid; grid-template-columns: 1fr 1.4fr; gap: 18px; }
+@media (max-width: 760px) { .booth-cols { grid-template-columns: 1fr; } }
+.takes li.sel { outline: 2px solid var(--accent); }
+.takes li .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.takes li select { padding: 4px; font-size: 13px; max-width: 120px; }
+.status-ok { color: var(--good); font-weight: 700; } .status-no { color: var(--muted); }
+.cue { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); background: #000c; padding: 8px 18px; border-radius: 12px; font-size: 26px; font-weight: 900; }
+.cue.go { background: var(--good); color: #062b20; }
+.line-seg.mine { box-shadow: 0 0 0 2px #fff inset; }
+.line-seg.done::after { content: ' ✔'; }
+.line-seg { cursor: pointer; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { background: #1b1736; border-radius: 20px; padding: 3px 10px; font-size: 12px; display: inline-flex; gap: 5px; align-items: center; }
+.editor { margin-top: 18px; padding: 14px; background: #1b1736; border-radius: 12px; display: grid; gap: 10px; }
+.editor table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.editor td, .editor th { padding: 4px; text-align: left; }
+.editor input[type=number] { width: 70px; } .editor input.hint { width: 100%; min-width: 90px; }
+.editor input, .editor select { background: var(--panel2); color: var(--text); border: 1px solid #4a4380; border-radius: 8px; padding: 4px 6px; font: inherit; }
+.progress { height: 6px; background: #1b1736; border-radius: 3px; overflow: hidden; } .progress i { display: block; height: 100%; background: var(--good); }
+.lane-name { background: #1b1736d9; padding: 0 5px; border-radius: 4px; pointer-events: none; z-index: 2; top: 7px; }

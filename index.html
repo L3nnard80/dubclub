@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dub Club</title>
-<link rel="stylesheet" href="style.css?v=2">
+<link rel="stylesheet" href="style.css?v=3">
 </head>
 <body>
 
@@ -61,23 +61,31 @@
         <div id="boothStage" class="stage"></div>
         <div id="countdown" class="countdown" hidden></div>
         <div id="recDot" class="rec-dot" hidden>● REC</div>
+        <div id="cue" class="cue" hidden></div>
       </div>
       <div id="timeline" class="timeline"></div>
       <div class="controls">
-        <button id="watchBtn" class="btn">▶ Watch</button>
-        <button id="recBtn" class="btn rec">● Record my voice</button>
+        <button id="watchBtn" class="btn">▶ Watch the whole scene</button>
         <button id="stopBtn" class="btn ghost" hidden>■ Stop</button>
-        <label class="chk"><input type="checkbox" id="hearOthers" checked> Hear other voices while recording (use headphones!)</label>
+        <label class="chk"><input type="checkbox" id="hearOthers" checked> Hear the other voices while recording (use headphones!)</label>
       </div>
       <div id="reviewBar" class="review" hidden>
-        <span>New take recorded!</span>
+        <span id="reviewText">Line recorded!</span>
         <button id="previewTakeBtn" class="btn">▶ Preview</button>
         <button id="saveTakeBtn" class="btn good">✔ Keep it</button>
         <button id="discardTakeBtn" class="btn ghost">✕ Retry</button>
       </div>
-      <h3>Voices in this scene</h3>
-      <ul id="takeList" class="takes"></ul>
-      <div class="pass-row" id="passRow"></div>
+      <div class="booth-cols">
+        <div>
+          <h3>🎭 Characters</h3>
+          <ul id="roleList" class="takes"></ul>
+        </div>
+        <div>
+          <h3>💬 Lines</h3>
+          <ul id="partList" class="takes"></ul>
+        </div>
+      </div>
+      <div id="editorBox"></div>
     </div>
   </div>
 </section>
@@ -105,7 +113,7 @@
 <div id="toasts"></div>
 
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script src="scenes.js?v=2"></script>
-<script src="app.js?v=2"></script>
+<script src="scenes.js?v=3"></script>
+<script src="app.js?v=3"></script>
 </body>
 </html>

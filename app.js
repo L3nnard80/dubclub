@@ -17,6 +17,9 @@ const mediaCache = new Map();   // media id -> Promise<Blob>
 const mediaWaiters = new Map(); // client: media id -> {resolve, reject}
 
 // ================================================================== HOST: game state lives here
+// Scene = { id, title, kind: 'builtin'|'video', key|src, createdBy, duration,
+//           roles: [{name, owner}], parts: [{id, role, start, end, hint}], takes: [{id, partId, playerId, playerName, src, at}] }
+// A "part" is one line of one character. Each part gets at most one take; at playback all takes are stitched together.
 const HOST = { S: null, media: new Map(), conns: new Map() };
 function newState() {
   return { version: 1, phase: 'studio', hostId: null, players: {}, scenes: [], events: [], eventSeq: 0, premiere: null };
@@ -28,7 +31,6 @@ function hEvent(type, text = '', extra = {}) {
 }
 const hName = pid => HOST.S.players[pid]?.name || 'Someone';
 function hScene(id) { const s = HOST.S.scenes.find(x => x.id === id); if (!s) throw new Error('Scene not found'); return s; }
-function hTake(s, id) { const t = s.takes.find(x => x.id === id); if (!t) throw new Error('Voice not found'); return t; }
 function publicState() {
   const s = HOST.S;
   return { version: s.version, phase: s.phase, hostId: s.hostId, scenes: s.scenes, events: s.events, premiere: s.premiere, serverNow: Date.now() / 1000,
@@ -40,6 +42,7 @@ function commit() {
   for (const c of HOST.conns.values()) if (c.open) c.send({ t: 'state', s: pub });
   onState(pub);
 }
+function hDropTake(sc, t) { HOST.media.delete(t.src); sc.takes.splice(sc.takes.indexOf(t), 1); }
 function act(a, d) {
   const s = HOST.S, pid = d.playerId, isHost = pid === s.hostId;
   if (a === 'join') {
@@ -56,9 +59,11 @@ function act(a, d) {
   if (!s.players[pid]) throw new Error('Unknown player - please rejoin');
   switch (a) {
     case 'addBuiltin': {
-      const sc = { id: uid(), title: String(d.title || 'Scene').slice(0, 60), kind: 'builtin', key: d.key, owner: pid, createdBy: pid, takes: [] };
-      if (!SCENES[sc.key]) throw new Error('Unknown scene');
-      s.scenes.push(sc); hEvent('info', `${hName(pid)} added '${sc.title}'`); break;
+      const def = SCENES[d.key]; if (!def) throw new Error('Unknown scene');
+      s.scenes.push({ id: uid(), title: def.title, kind: 'builtin', key: d.key, createdBy: pid, duration: def.duration,
+        roles: def.roles.map(r => ({ name: r.name, owner: null })),
+        parts: def.lines.map((l, i) => ({ id: 'p' + i, role: l.role, start: l.start, end: l.end, hint: l.hint })), takes: [] });
+      hEvent('info', `${hName(pid)} added '${def.title}'`); break;
     }
     case 'deleteScene': {
       const sc = hScene(d.sceneId);
@@ -66,25 +71,42 @@ function act(a, d) {
       sc.takes.forEach(t => HOST.media.delete(t.src)); if (sc.src) HOST.media.delete(sc.src);
       s.scenes.splice(s.scenes.indexOf(sc), 1); break;
     }
-    case 'give': {
-      const sc = hScene(d.sceneId), to = d.to;
-      if (!s.players[to]) throw new Error('Player not found');
-      const free = !sc.owner || !s.players[sc.owner]?.online;
-      if (!(sc.owner === pid || isHost || (free && to === pid))) throw new Error("You don't hold this scene");
-      sc.owner = to;
-      if (to === pid) hEvent('info', `${hName(pid)} grabbed '${sc.title}'`);
-      else {
-        hEvent('pass', `${hName(pid)} passed you '${sc.title}'`, { to, sceneId: sc.id });
-        hEvent('info', `${hName(pid)} passed '${sc.title}' to ${hName(to)}`);
+    case 'giveRole': {
+      const sc = hScene(d.sceneId), r = sc.roles.find(x => x.name === d.role), to = d.to || null;
+      if (!r) throw new Error('Character not found');
+      if (to && !s.players[to]) throw new Error('Player not found');
+      const free = !r.owner || !s.players[r.owner]?.online;
+      if (!(r.owner === pid || isHost || sc.createdBy === pid || (free && to === pid))) throw new Error("That character isn't yours to give");
+      r.owner = to;
+      if (to === pid) hEvent('info', `${hName(pid)} voices ${r.name} in '${sc.title}'`);
+      else if (to) {
+        hEvent('pass', `${hName(pid)} gave you ${r.name} in '${sc.title}'`, { to, sceneId: sc.id });
+        hEvent('info', `${hName(to)} now voices ${r.name} in '${sc.title}'`);
       }
       break;
     }
-    case 'deleteTake': {
-      const sc = hScene(d.sceneId), t = hTake(sc, d.takeId);
-      if (!(isHost || t.playerId === pid || sc.owner === pid)) throw new Error('Not allowed');
-      HOST.media.delete(t.src); sc.takes.splice(sc.takes.indexOf(t), 1); break;
+    case 'setParts': {
+      const sc = hScene(d.sceneId);
+      if (!(isHost || sc.createdBy === pid)) throw new Error('Only the host or whoever added the clip can cut it');
+      const names = [...new Set((d.roles || []).map(n => String(n).trim().slice(0, 24)).filter(Boolean))].slice(0, 10);
+      if (!names.length) throw new Error('Add at least one character');
+      sc.roles = names.map(name => ({ name, owner: sc.roles.find(r => r.name === name)?.owner || null }));
+      const dur = sc.duration || 600;
+      const parts = (d.parts || []).slice(0, 80).map(p => ({ role: String(p.role), start: Math.max(0, +p.start || 0), end: Math.min(dur, +p.end || 0), hint: String(p.hint || '').slice(0, 60) }))
+        .filter(p => names.includes(p.role) && p.end - p.start >= 0.2).sort((x, y) => x.start - y.start);
+      sc.parts = parts.map(p => {
+        const same = sc.parts.find(o => o.role === p.role && Math.abs(o.start - p.start) < 0.01 && Math.abs(o.end - p.end) < 0.01);
+        return { id: same ? same.id : 'p' + uid(5), ...p };
+      });
+      for (const t of [...sc.takes]) if (!sc.parts.some(p => p.id === t.partId)) hDropTake(sc, t);
+      hEvent('info', `${hName(pid)} cut '${sc.title}' into ${sc.parts.length} lines`); break;
     }
-    case 'muteTake': hTake(hScene(d.sceneId), d.takeId).muted = !!d.muted; break;
+    case 'deleteTake': {
+      const sc = hScene(d.sceneId), t = sc.takes.find(x => x.id === d.takeId);
+      if (!t) throw new Error('Voice not found');
+      if (!(isHost || t.playerId === pid)) throw new Error('Not allowed');
+      hDropTake(sc, t); break;
+    }
     case 'react': hEvent('react', '', { emoji: String(d.emoji || '👏').slice(0, 4), fromName: hName(pid) }); break;
     case 'premiereStart': case 'premiereGo': case 'premiereEnd':
       if (!isHost) throw new Error('Only the host controls the premiere');
@@ -100,15 +122,20 @@ function hUpload(pid, kind, meta, blob) {
   const id = uid(12);
   if (kind === 'video') {
     if (blob.size > MAX_VIDEO) throw new Error('Clip too big (max 60 MB)');
+    const title = String(meta.title || 'My clip').slice(0, 60), dur = Math.max(1, +meta.duration || 30);
     HOST.media.set(id, blob);
-    const title = String(meta.title || 'My clip').slice(0, 60);
-    HOST.S.scenes.push({ id: uid(), title, kind: 'video', src: id, owner: pid, createdBy: pid, takes: [] });
+    HOST.S.scenes.push({ id: uid(), title, kind: 'video', src: id, createdBy: pid, duration: dur,
+      roles: [{ name: 'Character 1', owner: null }, { name: 'Character 2', owner: null }],
+      parts: [{ id: 'p0', role: 'Character 1', start: 0, end: dur, hint: 'whole clip - cut it into lines!' }], takes: [] });
     hEvent('info', `${hName(pid)} uploaded '${title}'`);
   } else {
-    const sc = hScene(meta.sceneId);
+    const sc = hScene(meta.sceneId), part = sc.parts.find(p => p.id === meta.partId);
+    if (!part) throw new Error('That line no longer exists');
+    const role = sc.roles.find(r => r.name === part.role);
+    if (role?.owner !== pid && pid !== HOST.S.hostId) throw new Error(`You don't voice ${part.role} any more`);
+    for (const t of sc.takes.filter(t => t.partId === part.id)) hDropTake(sc, t);
     HOST.media.set(id, blob);
-    sc.takes.push({ id: uid(), playerId: pid, playerName: hName(pid), src: id, offset: +meta.offset || 0, muted: false });
-    hEvent('info', `${hName(pid)} recorded a voice for '${sc.title}'`);
+    sc.takes.push({ id: uid(), partId: part.id, playerId: pid, playerName: hName(pid), src: id, at: +meta.at || 0 });
   }
   return { mediaId: id };
 }
@@ -275,21 +302,28 @@ function loadBuf(id) {
   }
   return bufCache.get(id);
 }
+// Each recorded line is clipped to its window [s0, s1] (scene time) and placed so that audio time 0 = scene time `at`.
+const PRE = 0.25, POST = 0.6, LEAD = 1.5;
+function clipItem(buf, at, part) { return { buf, at, s0: part.start - PRE, s1: part.end + POST, partId: part.id }; }
 class Mixer {
-  constructor() { this.bufs = []; this.nodes = []; this.ready = Promise.resolve(); this.key = null; }
-  set(takes) {
-    const list = takes.filter(t => !t.muted), key = list.map(t => t.id).join();
+  constructor() { this.items = []; this.nodes = []; this.ready = Promise.resolve(); this.key = null; }
+  set(scene) {
+    const list = scene.takes.map(t => ({ t, part: scene.parts.find(p => p.id === t.partId) })).filter(x => x.part);
+    const key = list.map(x => x.t.id + x.part.start + x.part.end).join();
     if (key === this.key) return this.ready;
     this.key = key;
-    return this.ready = Promise.all(list.map(t => loadBuf(t.src).then(buf => ({ buf, offset: t.offset })).catch(() => null)))
-      .then(a => { if (this.key === key) this.bufs = a.filter(Boolean); });
+    return this.ready = Promise.all(list.map(({ t, part }) => loadBuf(t.src).then(buf => clipItem(buf, t.at, part)).catch(() => null)))
+      .then(a => { if (this.key === key) this.items = a.filter(Boolean); });
   }
-  play(from = 0, extra = []) {
+  play(from = 0, extra = [], excludePart = null) {
     this.stop(); AC.resume();
-    for (const b of [...this.bufs, ...extra]) {
-      const off = from + b.offset;
-      if (off >= b.buf.duration) continue;
-      const n = AC.createBufferSource(); n.buffer = b.buf; n.connect(AC.destination); n.start(0, Math.max(0, off));
+    const now = AC.currentTime + 0.02;
+    for (const it of [...this.items.filter(i => i.partId !== excludePart), ...extra]) {
+      const start = Math.max(it.s0, from, it.at);
+      const end = Math.min(it.s1, it.at + it.buf.duration);
+      if (start >= end) continue;
+      const n = AC.createBufferSource(); n.buffer = it.buf; n.connect(AC.destination);
+      n.start(now + (start - from), start - it.at, end - start);
       this.nodes.push(n);
     }
   }
@@ -298,7 +332,7 @@ class Mixer {
 
 // ================================================================== scene player
 class ScenePlayer {
-  constructor(el) { this.el = el; this.playing = false; this.onEnd = null; this.onTick = null; this.loadId = 0; }
+  constructor(el) { this.el = el; this.playing = false; this.onEnd = null; this.onTick = null; this.loadId = 0; this.until = 0; }
   async load(scene) {
     const myLoad = ++this.loadId;
     this.stop(); this.el.innerHTML = ''; this.scene = scene; this.video = null; this.def = null;
@@ -309,38 +343,36 @@ class ScenePlayer {
       this.duration = this.def.duration; this.draw(0);
     } else {
       this.el.innerHTML = '<div class="loading">⏳ Loading clip…</div>';
-      this.duration = 30;
+      this.duration = scene.duration || 30;
       let url; try { url = await mediaURL(scene.src); } catch { this.el.innerHTML = '<div class="loading">⚠ Could not load clip</div>'; return; }
       if (myLoad !== this.loadId) return;
       const v = this.video = document.createElement('video');
       v.src = url; v.muted = true; v.playsInline = true; v.preload = 'auto';
       this.el.innerHTML = ''; this.el.append(v);
       await new Promise(res => { v.onloadedmetadata = res; v.onerror = res; setTimeout(res, 8000); });
-      this.duration = isFinite(v.duration) && v.duration > 0 ? v.duration : 30;
+      if (isFinite(v.duration) && v.duration > 0) this.duration = v.duration;
       v.onended = () => this._end();
     }
   }
   draw(t) { this.ctx.clearRect(0, 0, SCENE_W, SCENE_H); this.def.draw(this.ctx, t); }
-  play(from = 0) {
-    this.stop(); this.playing = true;
-    if (this.def) {
-      this.t0 = performance.now() - from * 1000;
-      const loop = () => {
-        if (!this.playing) return;
-        const t = this.time();
-        if (t >= this.duration) { this.draw(this.duration); return this._end(); }
-        this.draw(t); this.onTick?.(t); this.raf = requestAnimationFrame(loop);
-      };
-      loop();
-    } else if (this.video) {
-      this.video.currentTime = from; this.video.play().catch(() => { });
-      const loop = () => { if (!this.playing) return; this.onTick?.(this.time()); this.raf = requestAnimationFrame(loop); };
-      loop();
-    } else setTimeout(() => this._end(), 0);
+  seek(t) { this.stop(); if (this.def) this.draw(t); else if (this.video) this.video.currentTime = t; this.onTick?.(t); }
+  play(from = 0, until = Infinity) {
+    this.stop(); this.playing = true; this.until = Math.min(until, this.duration);
+    if (this.def) this.t0 = performance.now() - from * 1000;
+    else if (this.video) { this.video.currentTime = from; this.video.play().catch(() => { }); }
+    else return setTimeout(() => this._end(), 0);
+    const loop = () => {
+      if (!this.playing) return;
+      const t = this.time();
+      if (t >= this.until) { if (this.def) this.draw(this.until); else this.video.pause(); return this._end(); }
+      if (this.def) this.draw(t);
+      this.onTick?.(t); this.raf = requestAnimationFrame(loop);
+    };
+    loop();
   }
   time() { return this.def ? (performance.now() - this.t0) / 1000 : (this.video?.currentTime || 0); }
   stop() { this.playing = false; cancelAnimationFrame(this.raf); this.video?.pause(); }
-  _end() { if (!this.playing) return; this.playing = false; this.onTick?.(this.duration); this.onEnd?.(); }
+  _end() { if (!this.playing) return; this.playing = false; this.onTick?.(Math.min(this.time(), this.until)); this.onEnd?.(); }
 }
 
 // ================================================================== start screen
@@ -424,6 +456,13 @@ function floater(emoji, from) {
 }
 
 // ================================================================== studio rendering
+const ROLE_COLORS = ['#4dabf7', '#ff922b', '#69db7c', '#da77f2', '#ffd43b', '#f783ac', '#38d9a9', '#ff6b6b', '#a9e34b', '#748ffc'];
+function roleColor(sc, name, roles = sc.roles) {
+  if (sc.kind === 'builtin') { const r = SCENES[sc.key]?.roles.find(x => x.name === name); if (r) return r.color; }
+  const i = roles.findIndex(r => (r.name ?? r) === name);
+  return ROLE_COLORS[(i < 0 ? 0 : i) % ROLE_COLORS.length];
+}
+const fmt = t => (Math.round(t * 10) / 10).toFixed(1) + 's';
 function syncList(container, items, key, html, emptyHtml) {
   if (!items.length) { container.innerHTML = emptyHtml; container._map = null; return; }
   const map = container._map || (container.innerHTML = '', new Map()), next = new Map();
@@ -439,23 +478,23 @@ function syncList(container, items, key, html, emptyHtml) {
   for (const [k, rec] of map) if (!next.has(k)) rec.el.remove();
   container._map = next;
 }
+const voicesMe = sc => sc.roles.some(r => r.owner === me.id);
 function sceneCard(s) {
-  const holder = player(s.owner), mine = s.owner === me.id;
-  const free = !holder || !holder.online;
-  const voices = s.takes.length;
-  const others = S.players.filter(p => p.id !== me.id);
+  const done = s.parts.filter(p => s.takes.some(t => t.partId === p.id)).length;
   const thumb = s.kind === 'builtin'
-    ? `<div class="thumb" style="background-image:url(${builtinThumb(s.key)})"><span class="badge">${SCENES[s.key].roles.map(r => esc(r.name)).join(' & ')}</span></div>`
-    : `<div class="thumb clip">🎞<span class="badge">uploaded clip</span></div>`;
-  let actions = `<button class="btn small" data-act="open" data-id="${s.id}">${mine ? '🎙 Dub it' : '▶ Watch'}</button>`;
-  if (mine || isHost()) {
-    const targets = isHost() && !mine ? S.players : others;
-    if (targets.length) actions += `<select data-act="give" data-id="${s.id}"><option value="">${mine ? 'Pass to…' : 'Give to…'}</option>${targets.map(p => `<option value="${p.id}">${esc(p.name)}${p.id === me.id ? ' (me)' : ''}</option>`).join('')}</select>`;
-  } else if (free) actions += `<button class="btn small" data-act="grab" data-id="${s.id}">✋ Grab</button>`;
+    ? `<div class="thumb" style="background-image:url(${builtinThumb(s.key)})"><span class="badge">${s.parts.length} lines</span></div>`
+    : `<div class="thumb clip">🎞<span class="badge">uploaded clip · ${s.parts.length} line${s.parts.length === 1 ? '' : 's'}</span></div>`;
+  const chips = s.roles.map(r => {
+    const p = player(r.owner);
+    return `<span class="chip"><span class="dot" style="width:8px;height:8px;border-radius:50%;background:${roleColor(s, r.name)}"></span>${esc(r.name)}: ${p ? esc(p.name) : '<i>free</i>'}</span>`;
+  }).join('');
+  let actions = `<button class="btn small" data-act="open" data-id="${s.id}">${voicesMe(s) ? '🎙 Record my lines' : '▶ Open'}</button>`;
   if (isHost() || s.createdBy === me.id) actions += `<button class="btn small ghost" data-act="del" data-id="${s.id}" title="Delete scene">🗑</button>`;
-  return `<div class="card ${mine ? 'mine' : ''}">${thumb}<div class="card-body">
+  return `<div class="card ${voicesMe(s) ? 'mine' : ''}">${thumb}<div class="card-body">
     <div class="card-title">${esc(s.title)}</div>
-    <div class="card-meta">${avatar(holder)} ${holder ? esc(holder.name) + (holder.online ? '' : ' (offline)') : 'nobody'} has it · 🎙 ${voices} voice${voices === 1 ? '' : 's'}</div>
+    <div class="chips">${chips}</div>
+    <div class="progress" title="${done} of ${s.parts.length} lines recorded"><i style="width:${s.parts.length ? done / s.parts.length * 100 : 0}%"></i></div>
+    <div class="card-meta">🎙 ${done} / ${s.parts.length} lines recorded</div>
     <div class="card-actions">${actions}</div></div></div>`;
 }
 function renderStudio() {
@@ -474,14 +513,14 @@ function renderStudio() {
     + (isHost() ? '<br><br>⚠ You are hosting: keep this tab open, or the game ends for everyone.' : '');
   $('#activity').innerHTML = S.events.filter(e => e.type === 'info').slice(-12).reverse().map(e => `<li>${esc(e.text)}</li>`).join('');
 
-  const mine = S.scenes.filter(s => s.owner === me.id), rest = S.scenes.filter(s => s.owner !== me.id);
-  syncList($('#myScenes'), mine, s => s.id, sceneCard, '<div class="empty">You hold no scenes. Add one below, grab a free one, or wait until someone passes you one!</div>');
+  const mine = S.scenes.filter(s => voicesMe(s) || s.createdBy === me.id), rest = S.scenes.filter(s => !mine.includes(s));
+  syncList($('#myScenes'), mine, s => s.id, sceneCard, '<div class="empty">No scenes yet. Add one below, or open a friend\'s scene and pick a character to voice!</div>');
   syncList($('#allScenes'), rest, s => s.id, sceneCard, '<div class="empty">No other scenes yet.</div>');
 
   if (!$('#addScenes').children.length) {
     $('#addScenes').innerHTML = Object.values(SCENES).map(d => `<button class="add-tile" data-act="add" data-key="${d.key}">
       <img src="${builtinThumb(d.key)}" alt=""><div>${esc(d.title)}<br><span class="me-tag">${d.duration}s · ${d.roles.map(r => esc(r.name)).join(' & ')}</span></div></button>`).join('')
-      + `<label class="add-tile upload"><div>📁 Upload your own clip<br><span class="me-tag">mp4 / webm, max 60 MB</span></div><input type="file" accept="video/*" id="uploadInput" hidden></label>`;
+      + `<label class="add-tile upload"><div>📁 Upload your own clip<br><span class="me-tag">mp4 / webm, max 60 MB.<br>The game cuts it into lines.</span></div><input type="file" accept="video/*" id="uploadInput" hidden></label>`;
     $('#uploadInput').onchange = uploadVideo;
   }
 }
@@ -490,108 +529,169 @@ document.addEventListener('click', e => {
   const id = b.dataset.id;
   switch (b.dataset.act) {
     case 'open': openBooth(id); break;
-    case 'grab': api('give', { sceneId: id, to: me.id }); break;
     case 'del': if (confirm('Delete this scene and all its voices?')) api('deleteScene', { sceneId: id }); break;
-    case 'add': api('addBuiltin', { key: b.dataset.key, title: SCENES[b.dataset.key].title }).then(() => toast('Scene added to your pile!')); break;
+    case 'add': api('addBuiltin', { key: b.dataset.key }).then(() => toast('Scene added! Open it and pick who voices which character.')); break;
   }
 });
-document.addEventListener('change', e => {
-  const sel = e.target.closest('select[data-act="give"]'); if (!sel || !sel.value) return;
-  const to = sel.value; sel.value = '';
-  api('give', { sceneId: sel.dataset.id, to }).then(() => { if (to !== me.id) toast(`Passed to ${esc(player(to)?.name)} ➜`); });
-});
+function videoDuration(file) {
+  return new Promise(res => {
+    const v = document.createElement('video'), url = URL.createObjectURL(file);
+    const done = d => { URL.revokeObjectURL(url); res(d); };
+    v.preload = 'metadata'; v.onloadedmetadata = () => done(isFinite(v.duration) ? v.duration : 30); v.onerror = () => done(30);
+    v.src = url; setTimeout(() => done(30), 10000);
+  });
+}
 async function uploadVideo(e) {
   const f = e.target.files[0]; e.target.value = '';
   if (!f) return;
   if (f.size > MAX_VIDEO) return toast('That clip is too big (max 60 MB). Try a shorter one!', 'err');
   const t = toast(`Uploading ${esc(f.name)}…`, '', 600000);
   try {
-    await upload('video', { title: f.name.replace(/\.[^.]+$/, '') }, f.slice(0, f.size, f.type || 'video/mp4'));
-    toast('Clip uploaded!');
+    const duration = await videoDuration(f);
+    await upload('video', { title: f.name.replace(/\.[^.]+$/, ''), duration }, f.slice(0, f.size, f.type || 'video/mp4'));
+    toast('Clip uploaded! Open it and press “✂ Cut this clip into lines”.', '', 7000);
   } catch (err) { toast('Upload failed: ' + esc(err.message), 'err'); }
   t.remove();
 }
 
 // ================================================================== dubbing booth
-const booth = { sceneId: null, player: new ScenePlayer($('#boothStage')), mixer: new Mixer(), rec: null, pending: null, busy: false };
+const booth = { sceneId: null, player: new ScenePlayer($('#boothStage')), mixer: new Mixer(), rec: null, pending: null, busy: false, sel: null, recPart: null };
+const ed = { open: false, roles: [], parts: [] };
 let micStream = null;
+const bScene = () => S?.scenes.find(x => x.id === booth.sceneId);
 
 async function openBooth(sceneId) {
   const s = S.scenes.find(x => x.id === sceneId); if (!s) return;
   closeBooth();
-  booth.sceneId = sceneId; booth.pending = null;
+  booth.sceneId = sceneId; booth.pending = null; booth.sel = null; ed.open = false;
   $('#booth').hidden = false; $('#reviewBar').hidden = true;
   $('#boothTitle').textContent = '🎙 ' + s.title;
-  updateBooth();
+  $('#timeline').innerHTML = '';
   setBusy(true);
+  updateBooth();
   await booth.player.load(s);
   if (booth.sceneId !== sceneId) return;
-  booth.player.onTick = t => setPlayhead(t);
-  buildTimeline(s);
+  booth.player.onTick = onBoothTick;
   setBusy(false);
+  updateBooth();
 }
-function closeBooth() { stopAll(); booth.sceneId = null; $('#booth').hidden = true; }
+function closeBooth() { stopAll(); booth.sceneId = null; ed.open = false; $('#booth').hidden = true; }
 $('#boothClose').onclick = closeBooth;
 
-function buildTimeline(s) {
-  const tl = $('#timeline'), dur = booth.player.duration;
-  if (s.kind !== 'builtin') { tl.className = 'timeline video-only'; tl.innerHTML = '<div class="playhead"></div>'; return; }
-  const def = SCENES[s.key];
+function buildTimeline(sc) {
+  const tl = $('#timeline'), dur = booth.player.duration || sc.duration || 1;
+  const roles = ed.open ? ed.roles : sc.roles.map(r => r.name), parts = ed.open ? ed.parts : sc.parts;
   tl.className = 'timeline';
-  tl.innerHTML = def.roles.map(r => `<div class="lane"><span class="lane-name">${esc(r.name)}</span>${def.lines.filter(l => l.role === r.name).map(l =>
-    `<div class="line-seg" style="left:${l.start / dur * 100}%;width:${(l.end - l.start) / dur * 100}%;background:${r.color}" title="${esc(l.hint)}">${esc(r.name)}: ${esc(l.hint)}</div>`).join('')}</div>`).join('')
-    + '<div class="playhead"></div>';
+  tl.innerHTML = roles.map(name => {
+    const owner = player(sc.roles.find(r => r.name === name)?.owner);
+    return `<div class="lane"><span class="lane-name">${esc(name)}${owner ? ' · ' + esc(owner.name) : ''}</span>${parts.map((p, i) => p.role !== name ? '' :
+      `<div class="line-seg ${!ed.open && sc.takes.some(t => t.partId === p.id) ? 'done' : ''} ${!ed.open && owner?.id === me.id ? 'mine' : ''}" data-seg="${ed.open ? i : p.id}"
+        style="left:${p.start / dur * 100}%;width:${Math.max(0.5, (p.end - p.start) / dur * 100)}%;background:${roleColor(sc, name, roles)}" title="${esc(p.hint)}">${esc(p.hint || name)}</div>`).join('')}</div>`;
+  }).join('') + '<div class="playhead"></div>';
+  setPlayhead(booth.player.time ? Math.min(booth.player.time() || 0, dur) : 0);
 }
-function setPlayhead(t) { const p = $('#timeline .playhead'); if (p) p.style.left = `calc(${Math.min(1, t / booth.player.duration) * 100}% - 1px)`; }
+function setPlayhead(t) { const p = $('#timeline .playhead'); if (p) p.style.left = `calc(${Math.min(1, t / (booth.player.duration || 1)) * 100}% - 1px)`; }
+$('#timeline').onclick = e => {
+  const seg = e.target.closest('[data-seg]');
+  if (seg) {
+    const sc = bScene(), p = ed.open ? ed.parts[+seg.dataset.seg] : sc.parts.find(x => x.id === seg.dataset.seg);
+    if (!p) return;
+    if (!ed.open) { booth.sel = p.id; renderParts(sc); }
+    if (!booth.busy) booth.player.seek(p.start);
+    return;
+  }
+  if (booth.busy && !ed.open) return;
+  const r = $('#timeline').getBoundingClientRect();
+  booth.player.seek((e.clientX - r.left) / r.width * booth.player.duration);
+};
+function onBoothTick(t) {
+  setPlayhead(t);
+  const cue = $('#cue'), sc = bScene(), p = booth.recPart && sc?.parts.find(x => x.id === booth.recPart);
+  if (!p || !booth.player.playing) { cue.hidden = true; return; }
+  cue.hidden = false;
+  if (t < p.start) { cue.className = 'cue'; cue.textContent = `Get ready… ${Math.ceil(p.start - t)}`; }
+  else if (t <= p.end) { cue.className = 'cue go'; cue.textContent = `🗣 ${p.role}: SPEAK!`; }
+  else { cue.className = 'cue'; cue.textContent = '…'; }
+}
 
 function updateBooth() {
-  const s = S.scenes.find(x => x.id === booth.sceneId);
-  if (!s) { closeBooth(); return toast('That scene was deleted', 'err'); }
-  const mine = s.owner === me.id;
-  booth.mixer.set(s.takes);
-  $('#recBtn').disabled = !mine || booth.busy;
-  $('#recBtn').title = mine ? '' : 'You need to hold this scene to record';
-  $('#takeList').innerHTML = s.takes.length ? s.takes.map(t => {
-    const p = player(t.playerId), canEdit = isHost() || t.playerId === me.id || mine;
-    return `<li class="${t.muted ? 'muted' : ''}">${avatar(p)}<span class="grow">${esc(t.playerName)}'s voice</span>
-      ${canEdit ? `<button class="btn small ghost" data-take="mute" data-tid="${t.id}" data-m="${t.muted ? 0 : 1}">${t.muted ? '🔇 Unmute' : '🔊 Mute'}</button>
-      <button class="btn small ghost" data-take="del" data-tid="${t.id}">🗑</button>` : ''}</li>`;
-  }).join('') : '<li class="me-tag">No voices yet — be the first!</li>';
-  const holder = player(s.owner);
-  const targets = S.players.filter(p => p.id !== s.owner);
-  $('#passRow').innerHTML = (mine || isHost()) && targets.length
-    ? `<b>${mine ? 'Done? Pass this scene to' : 'Give this scene to'}:</b> <select id="passSel">${targets.map(p => `<option value="${p.id}">${esc(p.name)}${p.online ? '' : ' (offline)'}</option>`).join('')}</select>
-       <button class="btn good" id="passBtn">Pass ➜</button>`
-    : `<span class="me-tag">${avatar(holder)} ${holder ? esc(holder.name) : 'Nobody'} holds this scene${mine ? ' — invite friends so you can pass it on!' : '. They can pass it to you.'}</span>`;
-  if ($('#passBtn')) $('#passBtn').onclick = () => {
-    const to = $('#passSel').value;
-    api('give', { sceneId: s.id, to }).then(() => { toast(`Passed to ${esc(player(to)?.name)} ➜`); closeBooth(); });
-  };
+  const sc = bScene();
+  if (!sc) { closeBooth(); return toast('That scene was deleted', 'err'); }
+  booth.mixer.set(sc);
+  if (booth.player.duration) buildTimeline(sc);
+  renderRoles(sc); renderParts(sc); renderEditor(sc);
+  setBusy(booth.busy);
 }
-$('#takeList').onclick = e => {
-  const b = e.target.closest('[data-take]'); if (!b) return;
-  if (b.dataset.take === 'mute') api('muteTake', { sceneId: booth.sceneId, takeId: b.dataset.tid, muted: b.dataset.m === '1' });
-  else if (confirm('Delete this voice?')) api('deleteTake', { sceneId: booth.sceneId, takeId: b.dataset.tid });
+function renderRoles(sc) {
+  const canManage = isHost() || sc.createdBy === me.id;
+  $('#roleList').innerHTML = sc.roles.map(r => {
+    const p = player(r.owner), mine = r.owner === me.id, free = !p || !p.online;
+    let actions = '';
+    if (!mine && free) actions += `<button class="btn small good" data-role-grab="${esc(r.name)}">✋ I'll voice this</button>`;
+    if (mine || canManage) actions += `<select data-role-give="${esc(r.name)}"><option value="">${mine ? 'Give to…' : 'Assign…'}</option>${S.players.filter(x => x.id !== r.owner).map(x => `<option value="${x.id}">${esc(x.name)}${x.id === me.id ? ' (me)' : ''}</option>`).join('')}${r.owner ? '<option value="__none">nobody</option>' : ''}</select>`;
+    const n = sc.parts.filter(x => x.role === r.name).length;
+    return `<li><span class="dot" style="background:${roleColor(sc, r.name)}"></span><span class="grow"><b>${esc(r.name)}</b> <span class="me-tag">${n} line${n === 1 ? '' : 's'}</span><br>
+      ${p ? avatar(p) + ' ' + esc(p.name) + (mine ? ' (you)' : '') : '<span class="me-tag">nobody yet</span>'}</span>${actions}</li>`;
+  }).join('');
+}
+$('#roleList').onclick = e => { const b = e.target.closest('[data-role-grab]'); if (b) api('giveRole', { sceneId: booth.sceneId, role: b.dataset.roleGrab, to: me.id }); };
+$('#roleList').onchange = e => {
+  const s = e.target.closest('[data-role-give]'); if (!s || !s.value) return;
+  const to = s.value === '__none' ? null : s.value; s.value = '';
+  api('giveRole', { sceneId: booth.sceneId, role: s.dataset.roleGive, to }).then(() => { if (to && to !== me.id) toast(`${esc(player(to)?.name)} now voices ${esc(s.dataset.roleGive)} ➜`); });
+};
+function renderParts(sc) {
+  if (!sc.parts.length) { $('#partList').innerHTML = '<li class="me-tag">No lines yet — cut the clip first.</li>'; return; }
+  $('#partList').innerHTML = sc.parts.map((p, i) => {
+    const owner = player(sc.roles.find(r => r.name === p.role)?.owner), mine = owner?.id === me.id;
+    const take = sc.takes.find(t => t.partId === p.id);
+    const canDel = take && (isHost() || take.playerId === me.id);
+    return `<li class="${booth.sel === p.id ? 'sel' : ''}" data-part="${p.id}"><span class="dot" style="background:${roleColor(sc, p.role)}"></span>
+      <span class="grow"><b>${i + 1}. ${esc(p.role)}</b> <span class="me-tag">${fmt(p.start)}–${fmt(p.end)}</span>${p.hint ? `<br><span class="me-tag">“${esc(p.hint)}”</span>` : ''}<br>
+      ${take ? `<span class="status-ok">✔ ${esc(take.playerName)}</span>` : `<span class="status-no">○ ${owner ? 'waiting for ' + esc(owner.name) : 'nobody voices this yet'}</span>`}</span>
+      <button class="btn small ghost" data-pact="watch" title="Watch this line">▶</button>
+      ${mine ? `<button class="btn small rec" data-pact="rec">${take ? '🔁 Redo' : '● Record'}</button>` : ''}
+      ${canDel ? '<button class="btn small ghost" data-pact="del" title="Delete this recording">🗑</button>' : ''}</li>`;
+  }).join('');
+}
+$('#partList').onclick = e => {
+  const li = e.target.closest('[data-part]'); if (!li) return;
+  const sc = bScene(), p = sc.parts.find(x => x.id === li.dataset.part); if (!p) return;
+  booth.sel = p.id;
+  const b = e.target.closest('[data-pact]');
+  if (!b) { renderParts(sc); if (!booth.busy) booth.player.seek(p.start); return; }
+  if (booth.busy) return;
+  if (b.dataset.pact === 'watch') watchPart(p);
+  else if (b.dataset.pact === 'rec') recordPart(p);
+  else if (b.dataset.pact === 'del') { const t = sc.takes.find(x => x.partId === p.id); if (t && confirm('Delete this recording?')) api('deleteTake', { sceneId: sc.id, takeId: t.id }); }
 };
 
 function stopAll() {
   if (booth.rec && booth.rec.state === 'recording') booth.rec.stop();
   booth.player.stop(); booth.mixer.stop();
-  $('#stopBtn').hidden = true; $('#recDot').hidden = true; $('#countdown').hidden = true;
+  $('#stopBtn').hidden = true; $('#recDot').hidden = true; $('#countdown').hidden = true; $('#cue').hidden = true;
   setBusy(false);
 }
 function setBusy(b) {
   booth.busy = b;
-  const s = S?.scenes.find(x => x.id === booth.sceneId);
-  $('#watchBtn').disabled = b; $('#recBtn').disabled = b || !s || s.owner !== me.id;
-  for (const id of ['#previewTakeBtn', '#saveTakeBtn', '#discardTakeBtn']) $(id).disabled = b;
+  $('#watchBtn').disabled = b;
+  for (const el of document.querySelectorAll('#partList [data-pact], #previewTakeBtn, #saveTakeBtn, #discardTakeBtn')) el.disabled = b;
 }
+const lineWindow = p => [Math.max(0, p.start - LEAD), Math.min(booth.player.duration, p.end + POST)];
 $('#watchBtn').onclick = async () => {
-  setBusy(true); $('#stopBtn').hidden = false;
+  if (ed.open) return toast('Save or cancel the cut first', 'err');
+  muteClip(); booth.recPart = null; setBusy(true); $('#stopBtn').hidden = false;
   await booth.mixer.ready;
   booth.player.onEnd = stopAll;
   booth.player.play(0); booth.mixer.play(0);
 };
+async function watchPart(p) {
+  muteClip(); booth.recPart = null; setBusy(true); $('#stopBtn').hidden = false;
+  await booth.mixer.ready;
+  const [a, b] = lineWindow(p);
+  booth.player.onEnd = stopAll;
+  booth.player.play(a, b); booth.mixer.play(a);
+}
 $('#stopBtn').onclick = () => { if (booth.rec?.state === 'recording') finishRecording(); else stopAll(); };
 
 async function getMic() {
@@ -600,62 +700,190 @@ async function getMic() {
   micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
   return micStream;
 }
-$('#recBtn').onclick = async () => {
+function muteClip() { if (booth.player.video && !ed.open) booth.player.video.muted = true; }
+async function recordPart(p) {
+  if (ed.open) return toast('Save or cancel the cut first', 'err');
+  muteClip();
   let stream;
   try { stream = await getMic(); } catch (e) { return toast('🎤 ' + esc(e.message || 'Microphone not allowed'), 'err', 8000); }
-  setBusy(true); $('#reviewBar').hidden = true; booth.pending = null;
+  setBusy(true); $('#reviewBar').hidden = true; booth.pending = null; booth.recPart = p.id;
   await booth.mixer.ready;
+  const [a, b] = lineWindow(p);
+  booth.player.seek(a);
   const cd = $('#countdown'); cd.hidden = false;
-  for (const n of [3, 2, 1]) { cd.textContent = n; await sleep(750); if (!booth.sceneId) return; }
+  for (const n of [3, 2, 1]) { cd.textContent = n; await sleep(700); if (!booth.sceneId) return; }
   cd.hidden = true;
   const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'].find(m => window.MediaRecorder?.isTypeSupported(m)) || '';
   const rec = booth.rec = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
   const chunks = [];
+  let at = a;
   rec.ondataavailable = e => e.data.size && chunks.push(e.data);
   rec.onstop = async () => {
     if (!booth.sceneId) return;
     const blob = new Blob(chunks, { type: (rec.mimeType || 'audio/webm').split(';')[0] });
     try {
       const buf = await AC.decodeAudioData(await blob.arrayBuffer());
-      booth.pending = { blob, buf, offset: booth.recOffset };
+      booth.pending = { blob, buf, at, part: p };
+      $('#reviewText').textContent = `${p.role}'s line recorded!`;
       $('#reviewBar').hidden = false;
     } catch { toast('Recording failed — try again', 'err'); }
   };
   await new Promise(res => { rec.onstart = res; rec.start(); });
   const t0 = performance.now();
   booth.player.onEnd = finishRecording;
-  booth.player.play(0);
-  if ($('#hearOthers').checked) booth.mixer.play(0);
-  booth.recOffset = (performance.now() - t0) / 1000;
+  booth.player.play(a, b);
+  if ($('#hearOthers').checked) booth.mixer.play(a, [], p.id);
+  at = a - (performance.now() - t0) / 1000;
   $('#recDot').hidden = false; $('#stopBtn').hidden = false;
-};
+}
 function finishRecording() { if (booth.rec?.state === 'recording') booth.rec.stop(); stopAll(); }
 
 $('#previewTakeBtn').onclick = async () => {
-  if (!booth.pending) return;
-  setBusy(true); $('#stopBtn').hidden = false;
+  const pd = booth.pending; if (!pd) return;
+  booth.recPart = null; setBusy(true); $('#stopBtn').hidden = false;
   await booth.mixer.ready;
+  const [a, b] = lineWindow(pd.part);
   booth.player.onEnd = stopAll;
-  booth.player.play(0);
-  booth.mixer.play(0, [{ buf: booth.pending.buf, offset: booth.pending.offset }]);
+  booth.player.play(a, b);
+  booth.mixer.play(a, [clipItem(pd.buf, pd.at, pd.part)], pd.part.id);
 };
 $('#discardTakeBtn').onclick = () => { booth.pending = null; $('#reviewBar').hidden = true; };
 $('#saveTakeBtn').onclick = async () => {
-  const p = booth.pending; if (!p) return;
+  const pd = booth.pending; if (!pd) return;
   setBusy(true);
   try {
-    const res = await upload('take', { sceneId: booth.sceneId, offset: p.offset }, p.blob);
-    bufCache.set(res.mediaId, Promise.resolve(p.buf));
+    const res = await upload('take', { sceneId: booth.sceneId, partId: pd.part.id, at: pd.at }, pd.blob);
+    bufCache.set(res.mediaId, Promise.resolve(pd.buf));
     booth.pending = null; $('#reviewBar').hidden = true;
-    toast('Voice saved! 🎉 Pass the scene on when you\'re done.');
+    const sc = bScene(), next = sc?.parts.find(x => x.start > pd.part.start && sc.roles.find(r => r.name === x.role)?.owner === me.id && !sc.takes.some(t => t.partId === x.id));
+    toast(next ? `Saved! 🎉 Next up: your line ${sc.parts.indexOf(next) + 1}` : 'Saved! 🎉');
+    if (next) { booth.sel = next.id; renderParts(sc); }
   } catch (e) { toast('Saving failed: ' + esc(e.message), 'err'); }
   setBusy(false);
 };
 
+// ------------------------------------------------------------------ cut editor (uploaded clips)
+function renderEditor(sc) {
+  const box = $('#editorBox');
+  if (sc.kind !== 'video' || !(isHost() || sc.createdBy === me.id)) { box.innerHTML = ''; return; }
+  if (!ed.open) {
+    box.innerHTML = `<div class="pass-row"><button class="btn" data-ed="open">✂ Cut this clip into lines</button>
+      <span class="me-tag">Split the clip into who-says-what. Everyone then records only their own lines, and the game puts the voices back together.</span></div>`;
+    return;
+  }
+  if (box.querySelector('.editor')) return; // already open: don't wipe what's being typed
+  drawEditor(sc);
+}
+function drawEditor(sc) {
+  const roleOpts = sel => ed.roles.map(r => `<option ${r === sel ? 'selected' : ''}>${esc(r)}</option>`).join('');
+  $('#editorBox').innerHTML = `<div class="editor">
+    <b>✂ Cut the clip into lines</b>
+    <div class="chips">Characters: ${ed.roles.map((r, i) => `<span class="chip"><span class="dot" style="width:8px;height:8px;border-radius:50%;background:${ROLE_COLORS[i % ROLE_COLORS.length]}"></span>
+      <input data-rname="${i}" value="${esc(r)}" style="width:110px"> <a href="#" data-ed="delrole" data-i="${i}">✕</a></span>`).join('')}
+      <button class="btn small" data-ed="addrole">+ Character</button></div>
+    <div class="controls" style="margin-top:0">
+      <button class="btn" data-ed="auto">🪄 Auto-cut (find where people talk)</button>
+      <button class="btn" data-ed="play">▶ Play with original sound</button>
+      <button class="btn" data-ed="pause">⏸</button>
+      <button class="btn" data-ed="add">➕ New line at playhead</button>
+    </div>
+    <table><tr><th>#</th><th>Character</th><th>Start</th><th>End</th><th>What happens (hint)</th><th></th></tr>
+    ${ed.parts.map((p, i) => `<tr data-row="${i}"><td>${i + 1}</td>
+      <td><select data-f="role">${roleOpts(p.role)}</select></td>
+      <td><input type="number" step="0.1" min="0" data-f="start" value="${p.start.toFixed(1)}"> <a href="#" data-ed="setstart" title="Set to playhead">⏱</a></td>
+      <td><input type="number" step="0.1" min="0" data-f="end" value="${p.end.toFixed(1)}"> <a href="#" data-ed="setend" title="Set to playhead">⏱</a></td>
+      <td><input class="hint" data-f="hint" value="${esc(p.hint)}" placeholder="e.g. angry about the pizza"></td>
+      <td><a href="#" data-ed="playrow" title="Play this line">▶</a> <a href="#" data-ed="delrow" title="Remove line">✕</a></td></tr>`).join('')}
+    </table>
+    ${ed.parts.length ? '' : '<span class="me-tag">No lines yet. Try 🪄 Auto-cut, or play the clip and press ➕ where someone starts talking.</span>'}
+    <div class="controls" style="margin-top:0"><button class="btn good" data-ed="save">✔ Save the cut</button><button class="btn ghost" data-ed="cancel">Cancel</button>
+      <span class="me-tag">Lines that change lose their old recordings.</span></div></div>`;
+  buildTimeline(sc);
+}
+function editorRedraw() { const sc = bScene(); if (sc) drawEditor(sc); }
+$('#editorBox').onclick = async e => {
+  const b = e.target.closest('[data-ed]'); if (!b) return;
+  e.preventDefault();
+  const sc = bScene(), row = +b.closest('[data-row]')?.dataset.row, t = booth.player.time();
+  const v = booth.player.video;
+  switch (b.dataset.ed) {
+    case 'open':
+      stopAll(); ed.open = true; ed.roles = sc.roles.map(r => r.name); ed.parts = sc.parts.map(p => ({ ...p }));
+      drawEditor(sc); break;
+    case 'cancel': ed.open = false; booth.player.stop(); if (v) v.muted = true; updateBooth(); break;
+    case 'save':
+      try { await api('setParts', { sceneId: sc.id, roles: ed.roles, parts: ed.parts }); ed.open = false; if (v) v.muted = true; booth.player.stop(); updateBooth(); toast('Cut saved! Now pick who voices which character.'); } catch { }
+      break;
+    case 'addrole': ed.roles.push('Character ' + (ed.roles.length + 1)); editorRedraw(); break;
+    case 'delrole': {
+      if (ed.roles.length <= 1) return toast('Keep at least one character', 'err');
+      const [gone] = ed.roles.splice(+b.dataset.i, 1);
+      ed.parts.forEach(p => { if (p.role === gone) p.role = ed.roles[0]; }); editorRedraw(); break;
+    }
+    case 'play': if (v) { v.muted = false; booth.player.play(t); } break;
+    case 'pause': booth.player.stop(); break;
+    case 'add': {
+      const dur = booth.player.duration;
+      ed.parts.push({ role: ed.roles[ed.parts.length % ed.roles.length], start: Math.min(t, dur - 0.5), end: Math.min(dur, t + 2), hint: '' });
+      ed.parts.sort((x, y) => x.start - y.start); editorRedraw(); break;
+    }
+    case 'setstart': ed.parts[row].start = t; if (ed.parts[row].end <= t) ed.parts[row].end = Math.min(booth.player.duration, t + 1); editorRedraw(); break;
+    case 'setend': ed.parts[row].end = Math.max(t, ed.parts[row].start + 0.2); editorRedraw(); break;
+    case 'delrow': ed.parts.splice(row, 1); editorRedraw(); break;
+    case 'playrow': if (v) { v.muted = false; booth.player.play(ed.parts[row].start, ed.parts[row].end); } break;
+    case 'auto': await autoCut(sc); break;
+  }
+};
+$('#editorBox').oninput = e => {
+  const sc = bScene();
+  if (e.target.dataset.rname !== undefined) {
+    const i = +e.target.dataset.rname, old = ed.roles[i], name = e.target.value.slice(0, 24);
+    ed.roles[i] = name; ed.parts.forEach(p => { if (p.role === old) p.role = name; });
+    for (const s of document.querySelectorAll('#editorBox select[data-f="role"]')) s.options[i].text = name;
+    buildTimeline(sc); return;
+  }
+  const f = e.target.dataset.f, row = +e.target.closest('[data-row]')?.dataset.row;
+  if (!f || isNaN(row)) return;
+  ed.parts[row][f] = f === 'start' || f === 'end' ? Math.max(0, parseFloat(e.target.value) || 0) : e.target.value;
+  buildTimeline(sc);
+};
+async function autoCut(sc) {
+  const t = toast('🪄 Listening to the clip…', '', 60000);
+  try {
+    const blob = await getMedia(sc.src);
+    let buf;
+    try { buf = await AC.decodeAudioData(await blob.arrayBuffer()); }
+    catch { throw new Error("Couldn't read the clip's sound. Cut it by hand with ➕."); }
+    const chans = Array.from({ length: buf.numberOfChannels }, (_, i) => buf.getChannelData(i));
+    const win = Math.floor(buf.sampleRate * 0.05), n = Math.floor(buf.length / win), rms = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      let sum = 0;
+      for (const ch of chans) for (let j = i * win; j < (i + 1) * win; j += 4) sum += ch[j] * ch[j];
+      rms[i] = Math.sqrt(sum / (win / 4) / chans.length);
+    }
+    const sorted = Array.from(rms).sort((a, b) => a - b);
+    const floor = sorted[Math.floor(n * 0.2)] || 0, peak = sorted[Math.floor(n * 0.95)] || 0;
+    if (peak - floor < 0.002) throw new Error('The clip seems to have no talking in it. Cut it by hand with ➕.');
+    const thr = floor + (peak - floor) * 0.25;
+    let segs = [], cur = null;
+    for (let i = 0; i < n; i++) {
+      const tt = i * 0.05;
+      if (rms[i] > thr) { if (cur && tt - cur[1] < 0.45) cur[1] = tt + 0.05; else { cur = [tt, tt + 0.05]; segs.push(cur); } }
+    }
+    segs = segs.filter(s => s[1] - s[0] >= 0.4).map(([a, b]) => [Math.max(0, a - 0.1), Math.min(buf.duration, b + 0.1)]);
+    if (!segs.length) throw new Error('No talking found. Cut it by hand with ➕.');
+    if (ed.roles.length < 2 && segs.length > 1) ed.roles.push('Character 2');
+    ed.parts = segs.map(([a, b], i) => ({ role: ed.roles[i % ed.roles.length], start: a, end: b, hint: '' }));
+    editorRedraw();
+    toast(`Found ${segs.length} lines! Check which character says each one, then save.`, '', 7000);
+  } catch (e) { toast(esc(e.message), 'err', 7000); }
+  t.remove();
+}
+
 // ================================================================== premiere
 const prem = { token: null, player: new ScenePlayer($('#premStage')), mixer: new Mixer(), auto: true };
 function playlist() {
-  const voiced = S.scenes.filter(s => s.takes.some(t => !t.muted));
+  const voiced = S.scenes.filter(s => s.takes.length);
   return voiced.length ? voiced : S.scenes;
 }
 function handlePremiere() {
@@ -689,6 +917,12 @@ $('#premHost').onchange = e => { if (e.target.id === 'autoAdv') prem.auto = e.ta
 document.querySelector('.reactions').onclick = e => { const b = e.target.closest('[data-e]'); if (b) api('react', { emoji: b.dataset.e }); };
 
 function titleCard(html) { const c = $('#premCard'); c.hidden = !html; if (html) c.innerHTML = html; }
+function castOf(s) {
+  return s.roles.map(r => {
+    const names = [...new Set(s.takes.filter(t => s.parts.find(p => p.id === t.partId)?.role === r.name).map(t => t.playerName))];
+    return names.length ? `${r.name}: ${names.join(' & ')}` : null;
+  }).filter(Boolean);
+}
 async function runPremiereScene(P) {
   const token = P.token;
   prem.player.stop(); prem.mixer.stop();
@@ -700,12 +934,12 @@ async function runPremiereScene(P) {
     titleCard(`🎬 The End<small>Starring the voices of ${esc(names.join(', ') || 'nobody (yet)')}</small>`);
     return;
   }
-  const voices = [...new Set(s.takes.filter(t => !t.muted).map(t => t.playerName))];
+  const cast = castOf(s);
   $('#premTitle').textContent = `🍿 Scene ${P.index + 1} / ${list.length}`;
-  $('#premCredits').textContent = voices.length ? 'Voices: ' + voices.join(', ') : 'No voices (silent film!)';
-  titleCard(`${esc(s.title)}<small>${voices.length ? 'starring ' + esc(voices.join(' & ')) : 'a silent masterpiece'}</small>`);
+  $('#premCredits').textContent = cast.length ? cast.join(' · ') : 'No voices (silent film!)';
+  titleCard(`${esc(s.title)}<small>${cast.length ? cast.map(esc).join('<br>') : 'a silent masterpiece'}</small>`);
   await prem.player.load(s);
-  await prem.mixer.set(s.takes);
+  await prem.mixer.set(s);
   if (prem.token !== token) return;
   const wait = P.startedAt - serverNow();
   if (wait > 0) await sleep(wait * 1000);
