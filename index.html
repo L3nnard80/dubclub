@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dub Club</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- JOIN -->
+<section id="join" class="center-screen">
+  <div class="join-card">
+    <h1 class="logo">🎬 Dub<span>Club</span></h1>
+    <p class="tag">Voice over silly scenes with your friends — then watch the premiere together.</p>
+    <input id="nameInput" maxlength="20" placeholder="Your name" autocomplete="off">
+    <button id="joinLinkBtn" class="btn big" hidden>🎟 Join game</button>
+    <button id="hostBtn" class="btn big">🎬 Host a new game</button>
+    <div id="joinCodeBox" class="code-row">
+      <input id="codeInput" maxlength="5" placeholder="Game code" autocomplete="off">
+      <button id="joinCodeBtn" class="btn">Join</button>
+    </div>
+    <p id="joinErr" class="err"></p>
+  </div>
+</section>
+
+<!-- STUDIO -->
+<section id="app" hidden>
+  <header>
+    <div class="logo small">🎬 Dub<span>Club</span></div>
+    <div id="hostBar"></div>
+  </header>
+  <div class="layout">
+    <aside>
+      <h3>Players</h3>
+      <ul id="playerList"></ul>
+      <div id="joinInfo"></div>
+      <h3>Activity</h3>
+      <ul id="activity"></ul>
+    </aside>
+    <main>
+      <h2>🎙 Your scenes <small>(scenes you hold — dub them, then pass them on)</small></h2>
+      <div id="myScenes" class="grid"></div>
+      <h2>📼 All scenes</h2>
+      <div id="allScenes" class="grid"></div>
+      <h2>➕ Add a scene</h2>
+      <div id="addScenes" class="add-row"></div>
+    </main>
+  </div>
+</section>
+
+<!-- DUBBING BOOTH -->
+<section id="booth" class="overlay" hidden>
+  <div class="booth">
+    <div class="booth-head">
+      <h2 id="boothTitle"></h2>
+      <button id="boothClose" class="btn ghost">✕ Close</button>
+    </div>
+    <div class="booth-body">
+      <div class="stage-wrap">
+        <div id="boothStage" class="stage"></div>
+        <div id="countdown" class="countdown" hidden></div>
+        <div id="recDot" class="rec-dot" hidden>● REC</div>
+      </div>
+      <div id="timeline" class="timeline"></div>
+      <div class="controls">
+        <button id="watchBtn" class="btn">▶ Watch</button>
+        <button id="recBtn" class="btn rec">● Record my voice</button>
+        <button id="stopBtn" class="btn ghost" hidden>■ Stop</button>
+        <label class="chk"><input type="checkbox" id="hearOthers" checked> Hear other voices while recording (use headphones!)</label>
+      </div>
+      <div id="reviewBar" class="review" hidden>
+        <span>New take recorded!</span>
+        <button id="previewTakeBtn" class="btn">▶ Preview</button>
+        <button id="saveTakeBtn" class="btn good">✔ Keep it</button>
+        <button id="discardTakeBtn" class="btn ghost">✕ Retry</button>
+      </div>
+      <h3>Voices in this scene</h3>
+      <ul id="takeList" class="takes"></ul>
+      <div class="pass-row" id="passRow"></div>
+    </div>
+  </div>
+</section>
+
+<!-- PREMIERE -->
+<section id="premiere" class="overlay dark" hidden>
+  <div class="premiere">
+    <div class="prem-head">
+      <h2 id="premTitle">🍿 Premiere</h2>
+      <div id="premCredits"></div>
+    </div>
+    <div class="stage-wrap">
+      <div id="premStage" class="stage"></div>
+      <div id="premCard" class="title-card" hidden></div>
+    </div>
+    <div class="reactions">
+      <button data-e="😂">😂</button><button data-e="👏">👏</button><button data-e="😱">😱</button>
+      <button data-e="🔥">🔥</button><button data-e="💀">💀</button><button data-e="🍅">🍅</button>
+    </div>
+    <div id="premHost" class="controls"></div>
+  </div>
+</section>
+
+<div id="floaters"></div>
+<div id="toasts"></div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="scenes.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
