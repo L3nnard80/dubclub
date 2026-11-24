@@ -575,7 +575,7 @@ async function openBooth(sceneId) {
   setBusy(false);
   updateBooth();
 }
-function closeBooth() { stopAll(); booth.sceneId = null; ed.open = false; $('#booth').hidden = true; }
+function closeBooth() { if (cut.sceneId) closeCutter(true); stopAll(); booth.sceneId = null; ed.open = false; $('#booth').hidden = true; }
 $('#boothClose').onclick = closeBooth;
 
 function buildTimeline(sc) {
@@ -762,98 +762,219 @@ $('#saveTakeBtn').onclick = async () => {
   setBusy(false);
 };
 
-// ------------------------------------------------------------------ cut editor (uploaded clips)
+// ------------------------------------------------------------------ cutting room (uploaded clips)
+const cut = { sceneId: null, roles: [], parts: [], open: null, sel: null, pick: null, dur: 1, stopAt: null, resume: false, dirty: false, raf: 0 };
+const cv = () => $('#cutVideo');
 function renderEditor(sc) {
   const box = $('#editorBox');
   if (sc.kind !== 'video' || !(isHost() || sc.createdBy === me.id)) { box.innerHTML = ''; return; }
-  if (!ed.open) {
-    box.innerHTML = `<div class="pass-row"><button class="btn" data-ed="open">✂ Cut this clip into lines</button>
-      <span class="me-tag">Split the clip into who-says-what. Everyone then records only their own lines, and the game puts the voices back together.</span></div>`;
+  box.innerHTML = `<div class="pass-row"><button class="btn" id="openCutter">✂ Open the cutting room</button>
+    <span class="me-tag">Play the clip, mark where each line starts and ends, and say which character speaks it.</span></div>`;
+  $('#openCutter').onclick = () => openCutter(sc);
+}
+async function openCutter(sc) {
+  stopAll();
+  Object.assign(cut, { sceneId: sc.id, roles: sc.roles.map(r => r.name), parts: sc.parts.map(p => ({ ...p })), open: null, sel: null, pick: null, stopAt: null, dirty: false });
+  // a fresh upload has one placeholder line covering the whole clip: drop it so the user starts clean
+  if (cut.parts.length === 1 && cut.parts[0].start === 0 && Math.abs(cut.parts[0].end - sc.duration) < 0.05 && !sc.takes.length) cut.parts = [];
+  $('#cutter').hidden = false;
+  $('#cutTitle').textContent = '✂ Cutting room — ' + sc.title;
+  const v = cv(); v.muted = false; v.playbackRate = +$('#cutSpeed').value;
+  try { v.src = await mediaURL(sc.src); } catch { toast('Could not load the clip', 'err'); return closeCutter(true); }
+  await new Promise(res => { if (v.readyState >= 1) res(); v.onloadedmetadata = res; v.onerror = res; setTimeout(res, 8000); });
+  cut.dur = isFinite(v.duration) && v.duration > 0 ? v.duration : sc.duration || 30;
+  v.currentTime = 0;
+  renderCutter();
+  cancelAnimationFrame(cut.raf); cutLoop();
+}
+function closeCutter(force) {
+  if (!force && cut.dirty && !confirm('Throw away your changes to the cut?')) return;
+  cv().pause(); cancelAnimationFrame(cut.raf);
+  $('#cutter').hidden = true; cut.sceneId = null;
+}
+const cutT = () => cv().currentTime || 0;
+const cutColor = name => ROLE_COLORS[Math.max(0, cut.roles.indexOf(name)) % ROLE_COLORS.length];
+function cutSeek(t) { cv().currentTime = Math.max(0, Math.min(cut.dur - 0.01, t)); cut.stopAt = null; }
+function cutPlay(on = cv().paused) {
+  if (cut.pick) return;
+  if (on) cv().play().catch(() => { }); else cv().pause();
+}
+function cutLoop() {
+  if (!cut.sceneId) return;
+  const t = cutT(), v = cv();
+  if (cut.stopAt !== null && t >= cut.stopAt) { v.pause(); cut.stopAt = null; }
+  $('#cutClock').textContent = `${t.toFixed(1)} / ${cut.dur.toFixed(1)}s`;
+  $('#cutPlayBtn').textContent = v.paused ? '▶ Play' : '⏸ Pause';
+  const head = $('#cutTimeline .playhead'); if (head) head.style.left = `calc(${t / cut.dur * 100}% - 1px)`;
+  const pend = $('#cutTimeline .pending-seg');
+  if (pend) { const a = cut.open, b = Math.max(a, t); pend.style.left = a / cut.dur * 100 + '%'; pend.style.width = Math.max(0.3, (b - a) / cut.dur * 100) + '%'; }
+  const badge = $('#cutOpenBadge');
+  badge.hidden = cut.open === null || !!cut.pick;
+  if (!badge.hidden) badge.textContent = `● Line started at ${cut.open.toFixed(1)}s — press 🔴 End line (E)`;
+  cut.raf = requestAnimationFrame(cutLoop);
+}
+function renderCutter() { renderCutTimeline(); renderCutRoles(); renderCutSel(); renderCutList(); renderCutPick(); }
+function renderCutTimeline() {
+  const lanes = cut.roles.map(name => `<div class="lane"><span class="lane-name">${esc(name)}</span>${cut.parts.map((p, i) => p.role !== name ? '' :
+    `<div class="line-seg ${cut.sel === i ? 'sel' : ''}" data-ci="${i}" style="left:${p.start / cut.dur * 100}%;width:${Math.max(0.5, (p.end - p.start) / cut.dur * 100)}%;background:${cutColor(name)}">${i + 1}${p.hint ? ' · ' + esc(p.hint) : ''}</div>`).join('')}</div>`).join('');
+  const pending = cut.open !== null ? '<div class="lane"><span class="lane-name">new line…</span><div class="pending-seg"></div></div>' : '';
+  $('#cutTimeline').innerHTML = pending + lanes + '<div class="playhead"></div>';
+}
+function renderCutRoles() {
+  $('#cutRoles').innerHTML = `<div class="chips">${cut.roles.map((r, i) => `<span class="chip"><span class="dot" style="width:10px;height:10px;border-radius:50%;background:${cutColor(r)}"></span>
+    <input data-crname="${i}" value="${esc(r)}" title="Rename"><a href="#" data-cut="delrole" data-i="${i}" title="Remove character">✕</a></span>`).join('')}
+    <button class="btn small" data-cut="addrole">+ Character</button></div>`;
+}
+function renderCutSel() {
+  const p = cut.parts[cut.sel];
+  if (!p) { $('#cutSel').innerHTML = '<span class="me-tag">Click a line in the timeline or the list to fine-tune it.</span>'; return; }
+  $('#cutSel').innerHTML = `
+    <div class="row"><b>Line ${cut.sel + 1}</b> <select data-cf="role">${cut.roles.map(r => `<option ${r === p.role ? 'selected' : ''}>${esc(r)}</option>`).join('')}</select>
+      <button class="btn small" data-cut="playsel">▶ Play line</button><button class="btn small ghost" data-cut="delsel">🗑 Delete</button></div>
+    <div class="row">Start <button class="btn small ghost" data-cut="nudge" data-f="start" data-d="-0.1">−</button><input type="number" step="0.1" data-cf="start" value="${p.start.toFixed(1)}"><button class="btn small ghost" data-cut="nudge" data-f="start" data-d="0.1">+</button>
+      <button class="btn small" data-cut="here" data-f="start">⏱ = playhead</button></div>
+    <div class="row">End&nbsp; <button class="btn small ghost" data-cut="nudge" data-f="end" data-d="-0.1">−</button><input type="number" step="0.1" data-cf="end" value="${p.end.toFixed(1)}"><button class="btn small ghost" data-cut="nudge" data-f="end" data-d="0.1">+</button>
+      <button class="btn small" data-cut="here" data-f="end">⏱ = playhead</button></div>
+    <div class="row"><input data-cf="hint" value="${esc(p.hint)}" placeholder="What happens? e.g. angry about the pizza" style="flex:1"></div>`;
+}
+function renderCutList() {
+  $('#cutList').innerHTML = cut.parts.length ? cut.parts.map((p, i) => `<li class="${cut.sel === i ? 'sel' : ''}" data-ci="${i}">
+    <span class="dot" style="background:${cutColor(p.role)}"></span><span class="grow"><b>${i + 1}. ${esc(p.role)}</b> <span class="me-tag">${fmt(p.start)}–${fmt(p.end)}</span>${p.hint ? `<br><span class="me-tag">“${esc(p.hint)}”</span>` : ''}</span></li>`).join('')
+    : '<li class="me-tag">No lines yet. Press ▶ Play, hit 🟢 Start line when someone starts talking and 🔴 End line when they stop.</li>';
+}
+function renderCutPick() {
+  const box = $('#cutPick');
+  if (!cut.pick) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = `<h3>Who says this line? <span class="me-tag">(${fmt(cut.pick.start)} – ${fmt(cut.pick.end)})</span></h3>
+    <div class="opts">${cut.roles.map((r, i) => `<button class="btn" data-cut="pick" data-r="${i}" style="background:${cutColor(r)}">${i < 9 ? `<kbd>${i + 1}</kbd> ` : ''}${esc(r)}</button>`).join('')}</div>
+    <div class="opts"><input id="cutNewRole" placeholder="New character name" maxlength="24"><button class="btn" data-cut="picknew">+ Add &amp; pick</button></div>
+    <div class="opts"><button class="btn ghost" data-cut="pickcancel">Throw this line away</button></div>`;
+}
+function selectCut(i, seek = true) {
+  cut.sel = i; renderCutTimeline(); renderCutSel(); renderCutList();
+  if (seek && cut.parts[i]) cutSeek(cut.parts[i].start);
+}
+function cutStart() {
+  if (cut.pick) return;
+  cut.open = cutT(); renderCutTimeline();
+}
+function cutEnd() {
+  if (cut.pick) return;
+  if (cut.open === null) return toast('Press 🟢 Start line first (when someone starts talking)', 'err');
+  const start = cut.open, end = cutT();
+  if (end - start < 0.2) return toast('That line is too short — let the clip run a bit longer before ending it', 'err');
+  cut.resume = !cv().paused; cv().pause();
+  cut.open = null; cut.pick = { start, end };
+  renderCutTimeline(); renderCutPick();
+}
+function cutPickRole(name) {
+  const { start, end } = cut.pick;
+  cut.parts.push({ role: name, start, end, hint: '' });
+  cut.parts.sort((a, b) => a.start - b.start);
+  cut.pick = null; cut.dirty = true;
+  selectCut(cut.parts.findIndex(p => p.start === start && p.end === end && p.role === name), false);
+  renderCutPick();
+  if (cut.resume) cv().play().catch(() => { });
+}
+function cutChanged() { cut.dirty = true; cut.parts.sort((a, b) => a.start - b.start); renderCutTimeline(); renderCutList(); }
+
+$('#cutter').addEventListener('click', async e => {
+  const seg = e.target.closest('[data-ci]');
+  if (seg) return selectCut(+seg.dataset.ci);
+  const b = e.target.closest('[data-cut]'); if (!b) return;
+  e.preventDefault();
+  const p = cut.parts[cut.sel], sc = bScene();
+  switch (b.dataset.cut) {
+    case 'play': cutPlay(); break;
+    case 'rw': cutSeek(cutT() - +b.dataset.s); break;
+    case 'start': cutStart(); break;
+    case 'end': cutEnd(); break;
+    case 'pick': cutPickRole(cut.roles[+b.dataset.r]); break;
+    case 'picknew': {
+      const name = $('#cutNewRole').value.trim().slice(0, 24);
+      if (!name) return $('#cutNewRole').focus();
+      if (!cut.roles.includes(name)) cut.roles.push(name);
+      renderCutRoles(); cutPickRole(name); break;
+    }
+    case 'pickcancel': cut.pick = null; renderCutPick(); renderCutTimeline(); break;
+    case 'addrole': cut.roles.push('Character ' + (cut.roles.length + 1)); cut.dirty = true; renderCutter(); break;
+    case 'delrole': {
+      const i = +b.dataset.i, name = cut.roles[i], n = cut.parts.filter(x => x.role === name).length;
+      if (cut.roles.length <= 1) return toast('Keep at least one character', 'err');
+      if (n && !confirm(`${name} has ${n} line(s). Remove the character and its lines?`)) return;
+      cut.roles.splice(i, 1); cut.parts = cut.parts.filter(x => x.role !== name); cut.sel = null; cut.dirty = true; renderCutter(); break;
+    }
+    case 'playsel': if (p) { cv().currentTime = Math.max(0, p.start - 0.3); cut.stopAt = p.end + 0.3; cv().play().catch(() => { }); } break;
+    case 'delsel': if (p) { cut.parts.splice(cut.sel, 1); cut.sel = null; cut.dirty = true; renderCutter(); } break;
+    case 'nudge': if (p) { p[b.dataset.f] = Math.max(0, Math.min(cut.dur, p[b.dataset.f] + +b.dataset.d)); fixPart(p); cutChanged(); renderCutSel(); } break;
+    case 'here': if (p) { p[b.dataset.f] = cutT(); fixPart(p); cutChanged(); renderCutSel(); } break;
+    case 'auto':
+      if (cut.parts.length && !confirm('Auto-cut replaces the lines you already have. Go ahead?')) return;
+      await autoCut(sc); break;
+    case 'save':
+      if (cut.open !== null) return toast('You still have an open line — press 🔴 End line first', 'err');
+      if (!cut.parts.length) return toast('Make at least one line first', 'err');
+      try {
+        await api('setParts', { sceneId: cut.sceneId, roles: cut.roles, parts: cut.parts });
+        closeCutter(true); toast('Cut saved! Now pick who voices which character.', '', 6000);
+      } catch { }
+      break;
+    case 'cancel': closeCutter(); break;
+  }
+});
+function fixPart(p) {
+  if (p.end - p.start < 0.2) { if (p.end >= cut.dur) p.start = p.end - 0.2; else p.end = p.start + 0.2; }
+  cut.sel = null; const i = cut.parts.indexOf(p); cut.parts.sort((a, b) => a.start - b.start); cut.sel = cut.parts.indexOf(p); return i;
+}
+$('#cutter').addEventListener('input', e => {
+  const t = e.target;
+  if (t.dataset.crname !== undefined) {
+    const i = +t.dataset.crname, old = cut.roles[i], name = t.value.slice(0, 24);
+    cut.roles[i] = name; cut.parts.forEach(p => { if (p.role === old) p.role = name; });
+    cut.dirty = true; renderCutTimeline(); renderCutList(); return;
+  }
+  const p = cut.parts[cut.sel], f = t.dataset.cf; if (!p || !f) return;
+  if (f === 'start' || f === 'end') { const val = parseFloat(t.value); if (isNaN(val)) return; p[f] = Math.max(0, Math.min(cut.dur, val)); }
+  else p[f] = f === 'hint' ? t.value.slice(0, 60) : t.value;
+  cut.dirty = true; renderCutTimeline(); renderCutList();
+});
+$('#cutter').addEventListener('change', e => {
+  if (e.target.id === 'cutSpeed') cv().playbackRate = +e.target.value;
+  if (e.target.dataset.cf === 'start' || e.target.dataset.cf === 'end') { const p = cut.parts[cut.sel]; if (p) { fixPart(p); cutChanged(); renderCutSel(); } }
+  if (e.target.dataset.crname !== undefined) renderCutSel();
+});
+$('#cutTimeline').addEventListener('click', e => {
+  if (e.target.closest('[data-ci]')) return;
+  const r = $('#cutTimeline').getBoundingClientRect();
+  cutSeek((e.clientX - r.left) / r.width * cut.dur);
+});
+document.addEventListener('keydown', e => {
+  if ($('#cutter').hidden) return;
+  const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName);
+  if (cut.pick) {
+    if (!typing && /^[1-9]$/.test(e.key) && cut.roles[+e.key - 1]) { e.preventDefault(); cutPickRole(cut.roles[+e.key - 1]); }
+    if (e.key === 'Enter' && e.target.id === 'cutNewRole') $('[data-cut="picknew"]').click();
+    if (e.key === 'Escape') { cut.pick = null; renderCutPick(); renderCutTimeline(); }
     return;
   }
-  if (box.querySelector('.editor')) return; // already open: don't wipe what's being typed
-  drawEditor(sc);
-}
-function drawEditor(sc) {
-  const roleOpts = sel => ed.roles.map(r => `<option ${r === sel ? 'selected' : ''}>${esc(r)}</option>`).join('');
-  $('#editorBox').innerHTML = `<div class="editor">
-    <b>✂ Cut the clip into lines</b>
-    <div class="chips">Characters: ${ed.roles.map((r, i) => `<span class="chip"><span class="dot" style="width:8px;height:8px;border-radius:50%;background:${ROLE_COLORS[i % ROLE_COLORS.length]}"></span>
-      <input data-rname="${i}" value="${esc(r)}" style="width:110px"> <a href="#" data-ed="delrole" data-i="${i}">✕</a></span>`).join('')}
-      <button class="btn small" data-ed="addrole">+ Character</button></div>
-    <div class="controls" style="margin-top:0">
-      <button class="btn" data-ed="auto">🪄 Auto-cut (find where people talk)</button>
-      <button class="btn" data-ed="play">▶ Play with original sound</button>
-      <button class="btn" data-ed="pause">⏸</button>
-      <button class="btn" data-ed="add">➕ New line at playhead</button>
-    </div>
-    <table><tr><th>#</th><th>Character</th><th>Start</th><th>End</th><th>What happens (hint)</th><th></th></tr>
-    ${ed.parts.map((p, i) => `<tr data-row="${i}"><td>${i + 1}</td>
-      <td><select data-f="role">${roleOpts(p.role)}</select></td>
-      <td><input type="number" step="0.1" min="0" data-f="start" value="${p.start.toFixed(1)}"> <a href="#" data-ed="setstart" title="Set to playhead">⏱</a></td>
-      <td><input type="number" step="0.1" min="0" data-f="end" value="${p.end.toFixed(1)}"> <a href="#" data-ed="setend" title="Set to playhead">⏱</a></td>
-      <td><input class="hint" data-f="hint" value="${esc(p.hint)}" placeholder="e.g. angry about the pizza"></td>
-      <td><a href="#" data-ed="playrow" title="Play this line">▶</a> <a href="#" data-ed="delrow" title="Remove line">✕</a></td></tr>`).join('')}
-    </table>
-    ${ed.parts.length ? '' : '<span class="me-tag">No lines yet. Try 🪄 Auto-cut, or play the clip and press ➕ where someone starts talking.</span>'}
-    <div class="controls" style="margin-top:0"><button class="btn good" data-ed="save">✔ Save the cut</button><button class="btn ghost" data-ed="cancel">Cancel</button>
-      <span class="me-tag">Lines that change lose their old recordings.</span></div></div>`;
-  buildTimeline(sc);
-}
-function editorRedraw() { const sc = bScene(); if (sc) drawEditor(sc); }
-$('#editorBox').onclick = async e => {
-  const b = e.target.closest('[data-ed]'); if (!b) return;
-  e.preventDefault();
-  const sc = bScene(), row = +b.closest('[data-row]')?.dataset.row, t = booth.player.time();
-  const v = booth.player.video;
-  switch (b.dataset.ed) {
-    case 'open':
-      stopAll(); ed.open = true; ed.roles = sc.roles.map(r => r.name); ed.parts = sc.parts.map(p => ({ ...p }));
-      drawEditor(sc); break;
-    case 'cancel': ed.open = false; booth.player.stop(); if (v) v.muted = true; updateBooth(); break;
-    case 'save':
-      try { await api('setParts', { sceneId: sc.id, roles: ed.roles, parts: ed.parts }); ed.open = false; if (v) v.muted = true; booth.player.stop(); updateBooth(); toast('Cut saved! Now pick who voices which character.'); } catch { }
-      break;
-    case 'addrole': ed.roles.push('Character ' + (ed.roles.length + 1)); editorRedraw(); break;
-    case 'delrole': {
-      if (ed.roles.length <= 1) return toast('Keep at least one character', 'err');
-      const [gone] = ed.roles.splice(+b.dataset.i, 1);
-      ed.parts.forEach(p => { if (p.role === gone) p.role = ed.roles[0]; }); editorRedraw(); break;
-    }
-    case 'play': if (v) { v.muted = false; booth.player.play(t); } break;
-    case 'pause': booth.player.stop(); break;
-    case 'add': {
-      const dur = booth.player.duration;
-      ed.parts.push({ role: ed.roles[ed.parts.length % ed.roles.length], start: Math.min(t, dur - 0.5), end: Math.min(dur, t + 2), hint: '' });
-      ed.parts.sort((x, y) => x.start - y.start); editorRedraw(); break;
-    }
-    case 'setstart': ed.parts[row].start = t; if (ed.parts[row].end <= t) ed.parts[row].end = Math.min(booth.player.duration, t + 1); editorRedraw(); break;
-    case 'setend': ed.parts[row].end = Math.max(t, ed.parts[row].start + 0.2); editorRedraw(); break;
-    case 'delrow': ed.parts.splice(row, 1); editorRedraw(); break;
-    case 'playrow': if (v) { v.muted = false; booth.player.play(ed.parts[row].start, ed.parts[row].end); } break;
-    case 'auto': await autoCut(sc); break;
-  }
-};
-$('#editorBox').oninput = e => {
-  const sc = bScene();
-  if (e.target.dataset.rname !== undefined) {
-    const i = +e.target.dataset.rname, old = ed.roles[i], name = e.target.value.slice(0, 24);
-    ed.roles[i] = name; ed.parts.forEach(p => { if (p.role === old) p.role = name; });
-    for (const s of document.querySelectorAll('#editorBox select[data-f="role"]')) s.options[i].text = name;
-    buildTimeline(sc); return;
-  }
-  const f = e.target.dataset.f, row = +e.target.closest('[data-row]')?.dataset.row;
-  if (!f || isNaN(row)) return;
-  ed.parts[row][f] = f === 'start' || f === 'end' ? Math.max(0, parseFloat(e.target.value) || 0) : e.target.value;
-  buildTimeline(sc);
-};
+  if (typing) return;
+  const k = e.key.toLowerCase();
+  if (k === ' ') { e.preventDefault(); cutPlay(); }
+  else if (k === 's') cutStart();
+  else if (k === 'e') cutEnd();
+  else if (k === 'arrowleft') { e.preventDefault(); cutSeek(cutT() - (e.shiftKey ? 5 : 1)); }
+  else if (k === 'arrowright') { e.preventDefault(); cutSeek(cutT() + (e.shiftKey ? 5 : 1)); }
+  else if ((k === 'delete' || k === 'backspace') && cut.parts[cut.sel]) { cut.parts.splice(cut.sel, 1); cut.sel = null; cut.dirty = true; renderCutter(); }
+  else if (k === 'escape' && cut.open !== null) { cut.open = null; renderCutTimeline(); }
+});
 async function autoCut(sc) {
   const t = toast('🪄 Listening to the clip…', '', 60000);
   try {
     const blob = await getMedia(sc.src);
     let buf;
     try { buf = await AC.decodeAudioData(await blob.arrayBuffer()); }
-    catch { throw new Error("Couldn't read the clip's sound. Cut it by hand with ➕."); }
+    catch { throw new Error("Couldn't read the clip's sound. Cut it by hand with Start / End line."); }
     const chans = Array.from({ length: buf.numberOfChannels }, (_, i) => buf.getChannelData(i));
     const win = Math.floor(buf.sampleRate * 0.05), n = Math.floor(buf.length / win), rms = new Float32Array(n);
     for (let i = 0; i < n; i++) {
@@ -863,7 +984,7 @@ async function autoCut(sc) {
     }
     const sorted = Array.from(rms).sort((a, b) => a - b);
     const floor = sorted[Math.floor(n * 0.2)] || 0, peak = sorted[Math.floor(n * 0.95)] || 0;
-    if (peak - floor < 0.002) throw new Error('The clip seems to have no talking in it. Cut it by hand with ➕.');
+    if (peak - floor < 0.002) throw new Error('The clip seems to have no talking in it. Cut it by hand.');
     const thr = floor + (peak - floor) * 0.25;
     let segs = [], cur = null;
     for (let i = 0; i < n; i++) {
@@ -871,11 +992,11 @@ async function autoCut(sc) {
       if (rms[i] > thr) { if (cur && tt - cur[1] < 0.45) cur[1] = tt + 0.05; else { cur = [tt, tt + 0.05]; segs.push(cur); } }
     }
     segs = segs.filter(s => s[1] - s[0] >= 0.4).map(([a, b]) => [Math.max(0, a - 0.1), Math.min(buf.duration, b + 0.1)]);
-    if (!segs.length) throw new Error('No talking found. Cut it by hand with ➕.');
-    if (ed.roles.length < 2 && segs.length > 1) ed.roles.push('Character 2');
-    ed.parts = segs.map(([a, b], i) => ({ role: ed.roles[i % ed.roles.length], start: a, end: b, hint: '' }));
-    editorRedraw();
-    toast(`Found ${segs.length} lines! Check which character says each one, then save.`, '', 7000);
+    if (!segs.length) throw new Error('No talking found. Cut it by hand.');
+    if (cut.roles.length < 2 && segs.length > 1) cut.roles.push('Character 2');
+    cut.parts = segs.map(([a, b], i) => ({ role: cut.roles[i % cut.roles.length], start: a, end: b, hint: '' }));
+    cut.sel = null; cut.dirty = true; renderCutter();
+    toast(`Found ${segs.length} lines! Click each one and pick the right character, then save.`, '', 8000);
   } catch (e) { toast(esc(e.message), 'err', 7000); }
   t.remove();
 }
