@@ -161,3 +161,14 @@ kbd { background: #0004; border-radius: 4px; padding: 0 6px; font-size: 13px; ma
 #cutList { max-height: 360px; overflow: auto; }
 #cutList li { cursor: pointer; }
 .cutter .stage-wrap { max-width: min(100%, calc(48vh * 16 / 9)); margin: 10px auto 0; }
+
+.subs { position: absolute; left: 0; right: 0; bottom: 64px; display: grid; justify-items: center; gap: 4px; pointer-events: none; padding: 0 20px; }
+.sub { background: #000b; color: #fff; padding: 5px 14px; border-radius: 8px; font-size: 20px; font-weight: 600; text-align: center; max-width: 90%; opacity: .6; transition: opacity .15s; }
+.sub.live { opacity: 1; }
+.sub.focus { font-size: 26px; outline: 2px solid var(--accent); }
+.sub.focus.live { background: #000d; outline-color: var(--good); }
+.countdown.live { background: transparent; pointer-events: none; }
+.line-edit { display: grid; gap: 6px; margin: 6px 0; }
+.line-edit textarea, #cutSel textarea { background: var(--panel2); color: var(--text); border: 1px solid #4a4380; border-radius: 8px; padding: 6px 8px; font: inherit; resize: vertical; width: 100%; }
+.words { font-size: 14px; }
+.takes li a[data-pact] { text-decoration: none; margin-left: 4px; }
