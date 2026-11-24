@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dub Club</title>
-<link rel="stylesheet" href="style.css?v=5">
+<link rel="stylesheet" href="style.css?v=6">
 </head>
 <body>
 
@@ -67,6 +67,8 @@
       <div class="controls">
         <button id="watchBtn" class="btn">▶ Watch the whole scene</button>
         <button id="stopBtn" class="btn ghost" hidden>■ Stop</button>
+        <label class="chk" id="origRow"><input type="checkbox" id="hearOrig" checked> 🔊 Hear the original clip on ▶ and ● Record
+          <input type="range" id="origVol" min="0.05" max="1" step="0.05" value="0.6" title="Original sound volume" style="width:90px"></label>
         <label class="chk"><input type="checkbox" id="hearOthers" checked> Hear the other voices while recording (use headphones!)</label>
       </div>
       <div id="reviewBar" class="review" hidden>
@@ -159,7 +161,7 @@
 <div id="toasts"></div>
 
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script src="scenes.js?v=5"></script>
-<script src="app.js?v=5"></script>
+<script src="scenes.js?v=6"></script>
+<script src="app.js?v=6"></script>
 </body>
 </html>

@@ -566,6 +566,7 @@ async function openBooth(sceneId) {
   booth.sceneId = sceneId; booth.pending = null; booth.sel = null; ed.open = false;
   $('#booth').hidden = false; $('#reviewBar').hidden = true;
   $('#boothTitle').textContent = '🎙 ' + s.title;
+  $('#origRow').hidden = s.kind !== 'video';
   $('#timeline').innerHTML = '';
   setBusy(true);
   updateBooth();
@@ -686,7 +687,7 @@ $('#watchBtn').onclick = async () => {
   booth.player.play(0); booth.mixer.play(0);
 };
 async function watchPart(p) {
-  muteClip(); booth.recPart = null; setBusy(true); $('#stopBtn').hidden = false;
+  clipSound(wantOrig()); booth.recPart = null; setBusy(true); $('#stopBtn').hidden = false;
   await booth.mixer.ready;
   const [a, b] = lineWindow(p);
   booth.player.onEnd = stopAll;
@@ -700,10 +701,17 @@ async function getMic() {
   micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
   return micStream;
 }
-function muteClip() { if (booth.player.video && !ed.open) booth.player.video.muted = true; }
+function muteClip() { clipSound(false); }
+// Original clip sound: on when watching/recording a single line (so you hear what to dub), off for dubbed playback.
+function clipSound(on) {
+  const v = booth.player.video; if (!v) return;
+  v.muted = !on; v.volume = +$('#origVol').value;
+}
+const wantOrig = () => $('#hearOrig').checked;
+$('#origVol').oninput = () => { if (booth.player.video) booth.player.video.volume = +$('#origVol').value; };
 async function recordPart(p) {
   if (ed.open) return toast('Save or cancel the cut first', 'err');
-  muteClip();
+  clipSound(wantOrig());
   let stream;
   try { stream = await getMic(); } catch (e) { return toast('🎤 ' + esc(e.message || 'Microphone not allowed'), 'err', 8000); }
   setBusy(true); $('#reviewBar').hidden = true; booth.pending = null; booth.recPart = p.id;
@@ -740,7 +748,7 @@ function finishRecording() { if (booth.rec?.state === 'recording') booth.rec.sto
 
 $('#previewTakeBtn').onclick = async () => {
   const pd = booth.pending; if (!pd) return;
-  booth.recPart = null; setBusy(true); $('#stopBtn').hidden = false;
+  muteClip(); booth.recPart = null; setBusy(true); $('#stopBtn').hidden = false;
   await booth.mixer.ready;
   const [a, b] = lineWindow(pd.part);
   booth.player.onEnd = stopAll;
