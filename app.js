@@ -17,31 +17,31 @@ const mediaCache = new Map();   // media id -> Promise<Blob>
 const mediaWaiters = new Map(); // client: media id -> {resolve, reject}
 
 // ================================================================== HOST: game state lives here
-const H = { S: null, media: new Map(), conns: new Map() };
+const HOST = { S: null, media: new Map(), conns: new Map() };
 function newState() {
   return { version: 1, phase: 'studio', hostId: null, players: {}, scenes: [], events: [], eventSeq: 0, premiere: null };
 }
 function hEvent(type, text = '', extra = {}) {
-  const s = H.S; s.eventSeq++;
+  const s = HOST.S; s.eventSeq++;
   s.events.push({ seq: s.eventSeq, type, text, to: null, ...extra });
   s.events = s.events.slice(-60);
 }
-const hName = pid => H.S.players[pid]?.name || 'Someone';
-function hScene(id) { const s = H.S.scenes.find(x => x.id === id); if (!s) throw new Error('Scene not found'); return s; }
+const hName = pid => HOST.S.players[pid]?.name || 'Someone';
+function hScene(id) { const s = HOST.S.scenes.find(x => x.id === id); if (!s) throw new Error('Scene not found'); return s; }
 function hTake(s, id) { const t = s.takes.find(x => x.id === id); if (!t) throw new Error('Voice not found'); return t; }
 function publicState() {
-  const s = H.S;
+  const s = HOST.S;
   return { version: s.version, phase: s.phase, hostId: s.hostId, scenes: s.scenes, events: s.events, premiere: s.premiere, serverNow: Date.now() / 1000,
     players: Object.values(s.players).map(p => ({ ...p, isHost: p.id === s.hostId })) };
 }
 function commit() {
-  H.S.version++;
+  HOST.S.version++;
   const pub = publicState();
-  for (const c of H.conns.values()) if (c.open) c.send({ t: 'state', s: pub });
+  for (const c of HOST.conns.values()) if (c.open) c.send({ t: 'state', s: pub });
   onState(pub);
 }
 function act(a, d) {
-  const s = H.S, pid = d.playerId, isHost = pid === s.hostId;
+  const s = HOST.S, pid = d.playerId, isHost = pid === s.hostId;
   if (a === 'join') {
     const name = (d.name || 'Player').trim().slice(0, 20) || 'Player';
     let id = d.playerId;
@@ -63,7 +63,7 @@ function act(a, d) {
     case 'deleteScene': {
       const sc = hScene(d.sceneId);
       if (!(isHost || sc.createdBy === pid)) throw new Error("Only the host or the scene's creator can delete it");
-      sc.takes.forEach(t => H.media.delete(t.src)); if (sc.src) H.media.delete(sc.src);
+      sc.takes.forEach(t => HOST.media.delete(t.src)); if (sc.src) HOST.media.delete(sc.src);
       s.scenes.splice(s.scenes.indexOf(sc), 1); break;
     }
     case 'give': {
@@ -82,7 +82,7 @@ function act(a, d) {
     case 'deleteTake': {
       const sc = hScene(d.sceneId), t = hTake(sc, d.takeId);
       if (!(isHost || t.playerId === pid || sc.owner === pid)) throw new Error('Not allowed');
-      H.media.delete(t.src); sc.takes.splice(sc.takes.indexOf(t), 1); break;
+      HOST.media.delete(t.src); sc.takes.splice(sc.takes.indexOf(t), 1); break;
     }
     case 'muteTake': hTake(hScene(d.sceneId), d.takeId).muted = !!d.muted; break;
     case 'react': hEvent('react', '', { emoji: String(d.emoji || '👏').slice(0, 4), fromName: hName(pid) }); break;
@@ -96,17 +96,17 @@ function act(a, d) {
   return {};
 }
 function hUpload(pid, kind, meta, blob) {
-  if (!H.S.players[pid]) throw new Error('Unknown player');
+  if (!HOST.S.players[pid]) throw new Error('Unknown player');
   const id = uid(12);
   if (kind === 'video') {
     if (blob.size > MAX_VIDEO) throw new Error('Clip too big (max 60 MB)');
-    H.media.set(id, blob);
+    HOST.media.set(id, blob);
     const title = String(meta.title || 'My clip').slice(0, 60);
-    H.S.scenes.push({ id: uid(), title, kind: 'video', src: id, owner: pid, createdBy: pid, takes: [] });
+    HOST.S.scenes.push({ id: uid(), title, kind: 'video', src: id, owner: pid, createdBy: pid, takes: [] });
     hEvent('info', `${hName(pid)} uploaded '${title}'`);
   } else {
     const sc = hScene(meta.sceneId);
-    H.media.set(id, blob);
+    HOST.media.set(id, blob);
     sc.takes.push({ id: uid(), playerId: pid, playerName: hName(pid), src: id, offset: +meta.offset || 0, muted: false });
     hEvent('info', `${hName(pid)} recorded a voice for '${sc.title}'`);
   }
@@ -117,8 +117,8 @@ function setupHostConn(c) {
     try {
       if (msg.t === 'join') {
         const { playerId } = act('join', { playerId: msg.pid, name: msg.name });
-        const old = H.conns.get(playerId); if (old && old !== c) old.close();
-        c.pid = playerId; H.conns.set(playerId, c);
+        const old = HOST.conns.get(playerId); if (old && old !== c) old.close();
+        c.pid = playerId; HOST.conns.set(playerId, c);
         c.send({ t: 'welcome', pid: playerId });
         commit();
       } else if (msg.t === 'ping') c.send({ t: 'pong', ct: msg.ct, st: Date.now() });
@@ -130,15 +130,15 @@ function setupHostConn(c) {
         try { const res = hUpload(c.pid, msg.kind, msg.meta, new Blob([msg.data], { type: msg.type })); commit(); c.send({ t: 'res', rid: msg.rid, ok: true, ...res }); }
         catch (e) { c.send({ t: 'res', rid: msg.rid, ok: false, error: e.message }); }
       } else if (msg.t === 'getMedia') {
-        const b = H.media.get(msg.id);
+        const b = HOST.media.get(msg.id);
         c.send({ t: 'media', id: msg.id, type: b?.type || '', data: b ? await b.arrayBuffer() : null });
       }
     } catch (e) { console.warn(e); }
   });
   c.on('close', () => {
-    if (c.pid && H.conns.get(c.pid) === c) {
-      H.conns.delete(c.pid);
-      const p = H.S.players[c.pid];
+    if (c.pid && HOST.conns.get(c.pid) === c) {
+      HOST.conns.delete(c.pid);
+      const p = HOST.S.players[c.pid];
       if (p) { p.online = false; hEvent('info', `${p.name} left`); commit(); }
     }
   });
@@ -150,8 +150,8 @@ function hostGame(name) {
     let started = false;
     p.on('open', () => {
       started = true; peer = p; amHost = true; roomCode = code;
-      H.S = newState();
-      me.id = act('join', { name }).playerId; H.S.players[me.id].online = true;
+      HOST.S = newState();
+      me.id = act('join', { name }).playerId; HOST.S.players[me.id].online = true;
       resolve(); commit();
     });
     p.on('connection', setupHostConn);
@@ -229,7 +229,7 @@ async function upload(kind, meta, blob) {
 function getMedia(id) {
   if (!mediaCache.has(id)) {
     const p = amHost
-      ? (H.media.has(id) ? Promise.resolve(H.media.get(id)) : Promise.reject(new Error('Media missing')))
+      ? (HOST.media.has(id) ? Promise.resolve(HOST.media.get(id)) : Promise.reject(new Error('Media missing')))
       : new Promise((resolve, reject) => {
         mediaWaiters.set(id, { resolve, reject }); hostConn.send({ t: 'getMedia', id });
         setTimeout(() => { if (mediaWaiters.delete(id)) reject(new Error('Download timed out')); }, 180000);
